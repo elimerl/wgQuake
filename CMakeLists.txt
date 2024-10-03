@@ -7,8 +7,9 @@ project(
 
 # Include webgpu directory, to define the 'webgpu' target
 add_subdirectory(webgpu)
+add_subdirectory(sdl2webgpu)
 
-add_executable(wgQuake main.c)
+add_executable(wgQuake main.c wgpu_app.h wgpu_app.c wgpu_utils.h wgpu_utils.c)
 
 set(SRC "${CMAKE_SOURCE_DIR}")
 set(COMMON_SOURCES
@@ -126,10 +127,13 @@ if (EMSCRIPTEN)
 	target_link_options(wgQuake PRIVATE -sUSE_SDL=2 -sLEGACY_GL_EMULATION -sGL_UNSAFE_OPTS=0 -sUSE_WEBGPU -sASYNCIFY -sINITIAL_MEMORY=512MB -sSTACK_SIZE=4MB --preload-file=../id1)
 else()
 	set(SDL_STATIC ON)
+	set(SDL_SHARED OFF)
 	add_subdirectory(SDL)
 	find_package(OpenGL REQUIRED)
-	target_link_libraries(wgQuake PRIVATE SDL2::SDL2-static ${OPENGL_LIBRARIES} wsock32 winmm)
+	target_link_libraries(wgQuake PRIVATE webgpu SDL2::SDL2-static sdl2webgpu ${OPENGL_LIBRARIES} wsock32 winmm)
 endif()
+
+set_property(TARGET wgQuake PROPERTY COMPILE_WARNING_AS_ERROR OFF)
 
 add_custom_command(TARGET wgQuake POST_BUILD COMMAND
 	${CMAKE_COMMAND} -E copy_if_different
