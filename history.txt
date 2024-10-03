@@ -1,0 +1,14 @@
+r_lerpmodels
+r_lerpmodels 0
+r_lerpmodels 1
+r_lerpmodels 0
+r_lerpmodels 1
+r_lerpmodels 0
+r_lerpmodels 1
+r_lerpmodels 0
+r_lerpmove 0
+cl_showfps
+fps
+con_showfps 1
+timedemo 001
+timedemo dem001
