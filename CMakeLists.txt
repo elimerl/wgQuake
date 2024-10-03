@@ -119,18 +119,27 @@ if (XCODE)
 	)
 endif()
 
+set(COMMON_LIBRARIES "sdl2webgpu" "webgpu")
+
+if (WIN32)
+set(PLATFORM_LIBRARIES wsock32 winmm)
+else()
+set(PLATFORM_LIBRARIES "") 
+endif()
+
 # Options that are specific to Emscripten
 if (EMSCRIPTEN)
 	# Generate a full web page rather than a simple WebAssembly module
 	set_target_properties(wgQuake PROPERTIES SUFFIX ".html")
 	target_compile_options(wgQuake PRIVATE --use-port=sdl2)
-	target_link_options(wgQuake PRIVATE -sUSE_SDL=2 -sLEGACY_GL_EMULATION -sGL_UNSAFE_OPTS=0 -sUSE_WEBGPU -sASYNCIFY -sINITIAL_MEMORY=512MB -sSTACK_SIZE=4MB --preload-file=../id1)
+	target_link_options(wgQuake PRIVATE -sUSE_SDL=2 -sUSE_WEBGPU -sASYNCIFY -sINITIAL_MEMORY=512MB -sSTACK_SIZE=4MB --preload-file=../id1)
+	target_link_libraries(wgQuake PRIVATE ${COMMON_LIBRARIES} ${PLATFORM_LIBRARIES})
 else()
 	set(SDL_STATIC ON)
 	set(SDL_SHARED OFF)
 	add_subdirectory(SDL)
 	find_package(OpenGL REQUIRED)
-	target_link_libraries(wgQuake PRIVATE webgpu SDL2::SDL2-static sdl2webgpu ${OPENGL_LIBRARIES} wsock32 winmm)
+	target_link_libraries(wgQuake PRIVATE ${COMMON_LIBRARIES} ${PLATFORM_LIBRARIES} ${OPENGL_LIBRARIES} SDL2::SDL2-static)
 endif()
 
 set_property(TARGET wgQuake PROPERTY COMPILE_WARNING_AS_ERROR OFF)

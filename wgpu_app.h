@@ -33,5 +33,7 @@ WGPUShaderModule WG_CreateShaderModule(const char *shaderSource);
 WGPURenderPipeline WG_CreateRenderPipeline(WGPUShaderModule shader,
                                            const char *vertexEntryPoint,
                                            const char *fragEntryPoint);
+WGPUBuffer WG_CreateBuffer(WGPUBufferUsageFlags usage, uint64_t size);
+void WG_WriteBuffer(WGPUBuffer buffer, int len, char *bytes);
 
 #endif

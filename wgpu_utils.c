@@ -2,6 +2,10 @@
 #include <assert.h>
 #include <stdio.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 typedef struct {
   WGPUAdapter adapter;
   bool requestEnded;
@@ -31,10 +35,10 @@ WGPUAdapter requestAdapterSync(WGPUInstance instance,
                              (void *)&adapterReqUserData);
 
 #ifdef __EMSCRIPTEN__
-  while (!userData.requestEnded) {
+  while (!adapterReqUserData.requestEnded) {
     emscripten_sleep(10);
   }
-#endif // __EMSCRIPTEN__
+#endif
   assert(adapterReqUserData.requestEnded);
 
   return adapterReqUserData.adapter;
@@ -50,7 +54,7 @@ DeviceRequestUserData deviceReqUserData;
 void onDeviceRequestEnded(WGPURequestDeviceStatus status, WGPUDevice device,
                           char const *message, void *pUserData) {
   DeviceRequestUserData *userData = (DeviceRequestUserData *)pUserData;
-  if (status == WGPURequestAdapterStatus_Success) {
+  if (status == WGPURequestDeviceStatus_Success) {
     userData->device = device;
   } else {
     fprintf(stderr, "Could not get WebGPU device! %s", message);
@@ -64,8 +68,8 @@ WGPUDevice requestDeviceSync(WGPUAdapter adapter,
                            (void *)&deviceReqUserData);
 
 #ifdef __EMSCRIPTEN__
-  while (!userData.requestEnded) {
-    emscripten_sleep(100);
+  while (!deviceReqUserData.requestEnded) {
+    emscripten_sleep(10);
   }
 #endif // __EMSCRIPTEN__
 

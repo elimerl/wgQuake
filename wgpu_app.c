@@ -20,9 +20,14 @@ void onDeviceError(WGPUErrorType type, char const *message, void *userData) {
 
 int WG_Init() {
   // Init WebGPU
-  WGPUInstanceDescriptor desc = {.nextInChain = NULL};
+  WGPUInstanceDescriptor desc = {
+      .nextInChain = NULL,
+  };
+#ifdef __EMSCRIPTEN__
+  app.instance = wgpuCreateInstance(NULL);
+#else
   app.instance = wgpuCreateInstance(&desc);
-
+#endif
   // Init SDL
   if (SDL_Init(SDL_INIT_VIDEO) < 0) {
     fprintf(stderr, "Could not init SDL!");
@@ -92,6 +97,9 @@ void WG_Destroy() {
 
 WGPUTextureView WG_NextSurfaceTextureView() {
   WGPUSurfaceTexture surfaceTexture;
+
+  printf("%p %p\n", app.surface, &surfaceTexture);
+
   wgpuSurfaceGetCurrentTexture(app.surface, &surfaceTexture);
   if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_Success) {
     return NULL;
@@ -106,6 +114,7 @@ WGPUTextureView WG_NextSurfaceTextureView() {
       .baseArrayLayer = 0,
       .arrayLayerCount = 1,
       .aspect = WGPUTextureAspect_All,
+
   };
 
   WGPUTextureView view =
@@ -171,4 +180,19 @@ WGPURenderPipeline WG_CreateRenderPipeline(WGPUShaderModule shader,
   };
 
   return wgpuDeviceCreateRenderPipeline(app.device, &desc);
+}
+
+WGPUBuffer WG_CreateBuffer(WGPUBufferUsageFlags usage, uint64_t size) {
+  WGPUBufferDescriptor desc = {.nextInChain = NULL,
+                               .label = NULL,
+
+                               .mappedAtCreation = false,
+                               .size = size,
+                               .usage = usage};
+
+  return wgpuDeviceCreateBuffer(app.device, &desc);
+}
+
+void WG_WriteBuffer(WGPUBuffer buffer, int size, char *data) {
+  wgpuQueueWriteBuffer(app.queue, buffer, 0, data, size);
 }

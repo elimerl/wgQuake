@@ -1,6 +1,4 @@
-
 #define SDL_MAIN_HANDLED
-#include "sdl2webgpu.h"
 #include <SDL2/SDL.h>
 #include <webgpu/webgpu.h>
 #if WEBGPU_BACKEND_WGPU
@@ -13,9 +11,105 @@
 
 #include "wgpu_app.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#endif
+
+WGPURenderPipeline pipeline;
+
+bool frame(double time, void *userdata) {
+  printf("frame\n");
+  WG *app = WG_Instance();
+
+  SDL_Event event;
+  while (SDL_PollEvent(&event)) {
+    if (event.type == SDL_QUIT)
+      app->shouldStop = true;
+    else if (event.type == SDL_WINDOWEVENT &&
+             event.window.event == SDL_WINDOWEVENT_CLOSE)
+      app->shouldStop = true;
+  }
+
+  WGPUTextureView targetView = WG_NextSurfaceTextureView();
+  if (!targetView)
+    app->shouldStop = true;
+
+  WGPUCommandEncoderDescriptor encoderDesc = {};
+  encoderDesc.nextInChain = NULL;
+  WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(app->device, &encoderDesc);
+
+  WGPURenderPassColorAttachment renderPassColorAttachment = {
+      .view = targetView,
+      .resolveTarget = NULL,
+      .loadOp = WGPULoadOp_Clear,
+      .storeOp = WGPUStoreOp_Store,
+      .clearValue = {1.0, 0.0, 0.0, 1.0}};
+
+#ifndef WEBGPU_BACKEND_WGPU
+  renderPassColorAttachment.depthSlice = 0;
+#endif
+
+  WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
+                                             .colorAttachmentCount = 1,
+                                             .colorAttachments =
+                                                 &renderPassColorAttachment,
+                                             .depthStencilAttachment = NULL,
+                                             .timestampWrites = NULL};
+
+  WGPURenderPassEncoder renderPass =
+      wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
+
+  // draw
+  wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
+  // Draw 1 instance of a 3-vertices shape
+  wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+
+  wgpuRenderPassEncoderEnd(renderPass);
+  wgpuRenderPassEncoderRelease(renderPass);
+
+  WGPUCommandBufferDescriptor cmdBufferDescriptor = {};
+  cmdBufferDescriptor.nextInChain = NULL;
+  WGPUCommandBuffer command =
+      wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
+  printf("%p\n", command);
+  wgpuCommandEncoderRelease(encoder);
+
+  wgpuQueueSubmit(app->queue, 1, &command);
+  // wgpuCommandBufferRelease(command);
+
+  wgpuTextureViewRelease(targetView);
+
+#ifndef __EMSCRIPTEN__
+  wgpuSurfacePresent(app->surface);
+#endif
+
+#if defined(WEBGPU_BACKEND_DAWN)
+  wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+  wgpuDevicePoll(app->device, false, NULL);
+#endif
+
+  if (app->shouldStop) {
+#if defined(WEBGPU_BACKEND_EMSCRIPTEN)
+    for (int i = 0; i < 5; ++i) {
+      emscripten_sleep(10);
+    }
+#endif
+    wgpuRenderPipelineRelease(pipeline);
+    WG_Destroy();
+  }
+
+  // return !app->shouldStop;
+  return false;
+}
+
 int main(int argc, char *argv[]) {
+  printf("WG start\n");
   WG *app = WG_Instance();
   WG_Init();
+  printf("WG Init success!\n");
 
   const char *shaderSource = "@vertex \
       fn vs_main(@builtin(vertex_index) in_vertex_index: u32) ->  \
@@ -33,81 +127,21 @@ int main(int argc, char *argv[]) {
        \
       @fragment \
       fn fs_main() -> @location(0) vec4f { \
-          return vec4f(0.0, 1.0, 1.0, 1.0); \
+          var c = vec3f(0.0, 0.5, 0.7); \
+          return vec4f(pow(c, vec3f(2.2)), 1.0); \
       }";
   WGPUShaderModule module = WG_CreateShaderModule(shaderSource);
   assert(module);
-  WGPURenderPipeline pipeline =
-      WG_CreateRenderPipeline(module, "vs_main", "fs_main");
+  pipeline = WG_CreateRenderPipeline(module, "vs_main", "fs_main");
   wgpuShaderModuleRelease(module);
 
-  while (!app->shouldStop) {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-      if (event.type == SDL_QUIT)
-        app->shouldStop = true;
-      else if (event.type == SDL_WINDOWEVENT &&
-               event.window.event == SDL_WINDOWEVENT_CLOSE)
-        app->shouldStop = true;
-    }
+#ifdef __EMSCRIPTEN__
+  emscripten_sleep(100);
 
-    WGPUTextureView targetView = WG_NextSurfaceTextureView();
-    if (!targetView)
-      break;
-
-    WGPUCommandEncoderDescriptor encoderDesc = {};
-    encoderDesc.nextInChain = NULL;
-    WGPUCommandEncoder encoder =
-        wgpuDeviceCreateCommandEncoder(app->device, &encoderDesc);
-
-    WGPURenderPassColorAttachment renderPassColorAttachment = {
-        .view = targetView,
-        .resolveTarget = NULL,
-        .loadOp = WGPULoadOp_Clear,
-        .storeOp = WGPUStoreOp_Store,
-        .clearValue = {1.0, 0.0, 0.0, 1.0}};
-
-    WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
-                                               .colorAttachmentCount = 1,
-                                               .colorAttachments =
-                                                   &renderPassColorAttachment,
-                                               .depthStencilAttachment = NULL,
-                                               .timestampWrites = NULL};
-
-    WGPURenderPassEncoder renderPass =
-        wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
-
-    // draw
-    wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
-    // Draw 1 instance of a 3-vertices shape
-    wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
-
-    wgpuRenderPassEncoderEnd(renderPass);
-    wgpuRenderPassEncoderRelease(renderPass);
-
-    WGPUCommandBufferDescriptor cmdBufferDescriptor = {};
-    cmdBufferDescriptor.nextInChain = NULL;
-    WGPUCommandBuffer command =
-        wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
-    wgpuCommandEncoderRelease(encoder);
-
-    wgpuQueueSubmit(app->queue, 1, &command);
-    wgpuCommandBufferRelease(command);
-
-    wgpuTextureViewRelease(targetView);
-
-#ifndef __EMSCRIPTEN__
-    wgpuSurfacePresent(app->surface);
+  emscripten_request_animation_frame_loop(frame, NULL);
+#else
+  while (!app->shouldStop)
+    frame(0.0, NULL);
 #endif
-
-#if defined(WEBGPU_BACKEND_DAWN)
-    wgpuDeviceTick(device);
-#elif defined(WEBGPU_BACKEND_WGPU)
-    wgpuDevicePoll(app->device, false, NULL);
-#endif
-  }
-
-  wgpuRenderPipelineRelease(pipeline);
-  WG_Destroy();
   return 0;
 }
