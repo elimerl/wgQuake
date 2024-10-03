@@ -7,9 +7,9 @@
 #if defined(WEBGPU_BACKEND_WGPU)
 #include <webgpu/wgpu.h>
 #endif
-RenderApp app;
+WG app;
 
-RenderApp *RenderApp_Instance() { return &app; }
+WG *WG_Instance() { return &app; }
 
 void onDeviceError(WGPUErrorType type, char const *message, void *userData) {
   fprintf(stderr, "Uncaptured device error: type %i", type);
@@ -18,7 +18,7 @@ void onDeviceError(WGPUErrorType type, char const *message, void *userData) {
   fprintf(stderr, "\n");
 }
 
-int RenderApp_Init() {
+int WG_Init() {
   // Init WebGPU
   WGPUInstanceDescriptor desc = {.nextInChain = NULL};
   app.instance = wgpuCreateInstance(&desc);
@@ -61,13 +61,12 @@ int RenderApp_Init() {
 
   int wwidth, wheight;
   SDL_GetWindowSize(app.window, &wwidth, &wheight);
-  WGPUTextureFormat surfaceFormat =
-      wgpuSurfaceGetPreferredFormat(app.surface, app.adapter);
+  app.surfaceFormat = wgpuSurfaceGetPreferredFormat(app.surface, app.adapter);
   WGPUSurfaceConfiguration config = {.nextInChain = NULL,
                                      .width = wwidth,
                                      .height = wheight,
                                      .usage = WGPUTextureUsage_RenderAttachment,
-                                     .format = surfaceFormat,
+                                     .format = app.surfaceFormat,
                                      .viewFormatCount = 0,
                                      .viewFormats = NULL,
                                      .device = app.device,
@@ -78,69 +77,7 @@ int RenderApp_Init() {
   return 0;
 }
 
-int RenderApp_Tick() {
-  SDL_Event event;
-  while (SDL_PollEvent(&event)) {
-    if (event.type == SDL_QUIT)
-      app.shouldStop = true;
-    else if (event.type == SDL_WINDOWEVENT &&
-             event.window.event == SDL_WINDOWEVENT_CLOSE)
-      app.shouldStop = true;
-  }
-
-  WGPUTextureView targetView = RenderApp_NextSurfaceTextureView();
-  if (!targetView)
-    return 1;
-
-  WGPUCommandEncoderDescriptor encoderDesc = {};
-  encoderDesc.nextInChain = NULL;
-  WGPUCommandEncoder encoder =
-      wgpuDeviceCreateCommandEncoder(app.device, &encoderDesc);
-
-  WGPURenderPassColorAttachment renderPassColorAttachment = {
-      .view = targetView,
-      .resolveTarget = NULL,
-      .loadOp = WGPULoadOp_Clear,
-      .storeOp = WGPUStoreOp_Store,
-      .clearValue = {1.0, 0.0, 0.0, 1.0}};
-
-  WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
-                                             .colorAttachmentCount = 1,
-                                             .colorAttachments =
-                                                 &renderPassColorAttachment,
-                                             .depthStencilAttachment = NULL,
-                                             .timestampWrites = NULL};
-
-  WGPURenderPassEncoder renderPass =
-      wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
-  wgpuRenderPassEncoderEnd(renderPass);
-  wgpuRenderPassEncoderRelease(renderPass);
-
-  WGPUCommandBufferDescriptor cmdBufferDescriptor = {};
-  cmdBufferDescriptor.nextInChain = NULL;
-  WGPUCommandBuffer command =
-      wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
-  wgpuCommandEncoderRelease(encoder);
-
-  wgpuQueueSubmit(app.queue, 1, &command);
-  wgpuCommandBufferRelease(command);
-
-  wgpuTextureViewRelease(targetView);
-
-#ifndef __EMSCRIPTEN__
-  wgpuSurfacePresent(app.surface);
-#endif
-
-#if defined(WEBGPU_BACKEND_DAWN)
-  wgpuDeviceTick(device);
-#elif defined(WEBGPU_BACKEND_WGPU)
-  wgpuDevicePoll(app.device, false, NULL);
-#endif
-
-  return 0;
-}
-
-void RenderApp_Destroy() {
+void WG_Destroy() {
   wgpuQueueRelease(app.queue);
   wgpuDeviceRelease(app.device);
   wgpuAdapterRelease(app.adapter);
@@ -153,7 +90,7 @@ void RenderApp_Destroy() {
   SDL_Quit();
 }
 
-WGPUTextureView RenderApp_NextSurfaceTextureView() {
+WGPUTextureView WG_NextSurfaceTextureView() {
   WGPUSurfaceTexture surfaceTexture;
   wgpuSurfaceGetCurrentTexture(app.surface, &surfaceTexture);
   if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_Success) {
@@ -175,4 +112,63 @@ WGPUTextureView RenderApp_NextSurfaceTextureView() {
       wgpuTextureCreateView(surfaceTexture.texture, &viewDescriptor);
 
   return view;
+}
+
+WGPUShaderModule WG_CreateShaderModule(const char *shaderSource) {
+  WGPUShaderModuleWGSLDescriptor shaderCodeDesc = {
+      .code = shaderSource,
+      .chain = {NULL, WGPUSType_ShaderModuleWGSLDescriptor}};
+  WGPUShaderModuleDescriptor shaderDesc = {
+      .label = NULL, .nextInChain = &shaderCodeDesc.chain};
+#ifdef WEBGPU_BACKEND_WGPU
+  shaderDesc.hintCount = 0;
+  shaderDesc.hints = NULL;
+#endif
+  return wgpuDeviceCreateShaderModule(app.device, &shaderDesc);
+}
+
+WGPURenderPipeline WG_CreateRenderPipeline(WGPUShaderModule shader,
+                                           const char *vertexEntryPoint,
+                                           const char *fragEntryPoint) {
+  WGPUVertexState vertexState = {.nextInChain = NULL,
+                                 .bufferCount = 0,
+                                 .buffers = NULL,
+                                 .module = shader,
+                                 .entryPoint = vertexEntryPoint,
+                                 .constantCount = 0,
+                                 .constants = NULL};
+
+  WGPUBlendState blendState = {
+      .color = {WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha,
+                WGPUBlendFactor_OneMinusSrcAlpha},
+      .alpha = {WGPUBlendOperation_Add, WGPUBlendFactor_Zero,
+                WGPUBlendFactor_One}};
+
+  WGPUColorTargetState colorTarget = {.format = app.surfaceFormat,
+                                      .blend = &blendState,
+                                      .writeMask = WGPUColorWriteMask_All};
+
+  WGPUFragmentState fragmentState = {.nextInChain = NULL,
+                                     .module = shader,
+                                     .entryPoint = fragEntryPoint,
+                                     .constantCount = 0,
+                                     .constants = NULL,
+                                     .targetCount = 1,
+                                     .targets = &colorTarget};
+  WGPURenderPipelineDescriptor desc = {
+      .nextInChain = NULL,
+      .label = NULL,
+
+      .vertex = vertexState,
+      .fragment = &fragmentState,
+      .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
+                    .stripIndexFormat = WGPUIndexFormat_Undefined,
+                    .frontFace = WGPUFrontFace_CCW,
+                    .cullMode = WGPUCullMode_Back},
+      .layout = NULL,
+      .multisample = {NULL, 1, ~0u, false},
+      .depthStencil = NULL,
+  };
+
+  return wgpuDeviceCreateRenderPipeline(app.device, &desc);
 }

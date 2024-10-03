@@ -16,16 +16,22 @@ typedef struct {
 
   WGPUSurface surface;
 
+  WGPUTextureFormat surfaceFormat;
+
   bool shouldStop;
-} RenderApp;
+} WG;
 
-RenderApp *RenderApp_Instance();
+WG *WG_Instance();
 
-int RenderApp_Init();
-int RenderApp_Tick();
-void RenderApp_Destroy();
+int WG_Init();
+void WG_Destroy();
 
-WGPUTextureView RenderApp_NextSurfaceTextureView();
+WGPUTextureView WG_NextSurfaceTextureView();
 
+WGPUShaderModule WG_CreateShaderModule(const char *shaderSource);
+
+WGPURenderPipeline WG_CreateRenderPipeline(WGPUShaderModule shader,
+                                           const char *vertexEntryPoint,
+                                           const char *fragEntryPoint);
 
 #endif
