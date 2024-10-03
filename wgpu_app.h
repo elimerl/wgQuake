@@ -4,6 +4,8 @@
 #include <SDL2/SDL.h>
 #include <webgpu/webgpu.h>
 
+#include <stdbool.h>
+
 typedef struct {
   SDL_Window *window;
 
@@ -13,9 +15,17 @@ typedef struct {
   WGPUQueue queue;
 
   WGPUSurface surface;
-} RenderAppData;
+
+  bool shouldStop;
+} RenderApp;
+
+RenderApp *RenderApp_Instance();
 
 int RenderApp_Init();
+int RenderApp_Tick();
+void RenderApp_Destroy();
+
 WGPUTextureView RenderApp_NextSurfaceTextureView();
+
 
 #endif
