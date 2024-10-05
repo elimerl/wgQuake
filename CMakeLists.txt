@@ -41,6 +41,7 @@ set(COMMON_SOURCES
 "${SRC}/Quake/gl_texmgr.c"
 "${SRC}/Quake/gl_vidsdl.c"
 "${SRC}/Quake/gl_warp.c"
+"${SRC}/Quake/gl_wgpu_utils.c"
 "${SRC}/Quake/host_cmd.c"
 "${SRC}/Quake/host.c"
 "${SRC}/Quake/image.c"

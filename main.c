@@ -21,97 +21,92 @@ WGPURenderPipeline pipeline;
 int main_SDL(int argc, char *argv[]);
 
 bool frame(double time, void *userdata) {
+  //   WG *app = WG_Instance();
 
-  WG *app = WG_Instance();
+  //   SDL_Event event;
+  //   while (SDL_PollEvent(&event)) {
+  //     if (event.type == SDL_QUIT)
+  //       app->shouldStop = true;
+  //     else if (event.type == SDL_WINDOWEVENT &&
+  //              event.window.event == SDL_WINDOWEVENT_CLOSE)
+  //       app->shouldStop = true;
+  //   }
 
-  SDL_Event event;
-  while (SDL_PollEvent(&event)) {
-    if (event.type == SDL_QUIT)
-      app->shouldStop = true;
-    else if (event.type == SDL_WINDOWEVENT &&
-             event.window.event == SDL_WINDOWEVENT_CLOSE)
-      app->shouldStop = true;
-  }
+  //   WGPUTextureView targetView = WG_NextSurfaceTextureView();
+  //   if (!targetView)
+  //     app->shouldStop = true;
 
-  WGPUTextureView targetView = WG_NextSurfaceTextureView();
-  if (!targetView)
-    app->shouldStop = true;
+  //   WGPUCommandEncoderDescriptor encoderDesc;
+  //   encoderDesc.nextInChain = NULL;
+  //   WGPUCommandEncoder encoder =
+  //       wgpuDeviceCreateCommandEncoder(app->device, &encoderDesc);
 
-  WGPUCommandEncoderDescriptor encoderDesc;
-  encoderDesc.nextInChain = NULL;
-  WGPUCommandEncoder encoder =
-      wgpuDeviceCreateCommandEncoder(app->device, &encoderDesc);
+  //   WGPURenderPassColorAttachment renderPassColorAttachment = {
+  //       .view = targetView,
+  //       .resolveTarget = NULL,
+  //       .loadOp = WGPULoadOp_Clear,
+  //       .storeOp = WGPUStoreOp_Store,
+  //       .clearValue = {1.0, 0.0, 0.0, 1.0}};
 
-  WGPURenderPassColorAttachment renderPassColorAttachment = {
-      .view = targetView,
-      .resolveTarget = NULL,
-      .loadOp = WGPULoadOp_Clear,
-      .storeOp = WGPUStoreOp_Store,
-      .clearValue = {1.0, 0.0, 0.0, 1.0}};
+  // #ifndef WEBGPU_BACKEND_WGPU
+  //   renderPassColorAttachment.depthSlice = 0; // wgpu doesn't implement this?
+  // #endif
 
-#ifndef WEBGPU_BACKEND_WGPU
-  renderPassColorAttachment.depthSlice = 0; // wgpu doesn't implement this?
-#endif
+  //   WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
+  //                                              .colorAttachmentCount = 1,
+  //                                              .colorAttachments =
+  //                                                  &renderPassColorAttachment,
+  //                                              .depthStencilAttachment =
+  //                                              NULL, .timestampWrites =
+  //                                              NULL};
 
-  WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
-                                             .colorAttachmentCount = 1,
-                                             .colorAttachments =
-                                                 &renderPassColorAttachment,
-                                             .depthStencilAttachment = NULL,
-                                             .timestampWrites = NULL};
+  //   WGPURenderPassEncoder renderPass =
+  //       wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
 
-  WGPURenderPassEncoder renderPass =
-      wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
+  //   // draw
+  //   wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
+  //   wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+  //   // end draw
 
-  // draw
-  wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
-  wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
-  // end draw
+  //   wgpuRenderPassEncoderEnd(renderPass);
+  //   wgpuRenderPassEncoderRelease(renderPass);
 
-  wgpuRenderPassEncoderEnd(renderPass);
-  wgpuRenderPassEncoderRelease(renderPass);
+  //   WGPUCommandBufferDescriptor cmdBufferDescriptor;
+  //   cmdBufferDescriptor.nextInChain = NULL;
+  //   WGPUCommandBuffer command =
+  //       wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
+  //   wgpuCommandEncoderRelease(encoder);
 
-  WGPUCommandBufferDescriptor cmdBufferDescriptor;
-  cmdBufferDescriptor.nextInChain = NULL;
-  WGPUCommandBuffer command =
-      wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
-  wgpuCommandEncoderRelease(encoder);
+  //   wgpuQueueSubmit(app->queue, 1, &command);
+  //   wgpuCommandBufferRelease(command);
 
-  wgpuQueueSubmit(app->queue, 1, &command);
-  wgpuCommandBufferRelease(command);
+  //   wgpuTextureViewRelease(targetView);
 
-  wgpuTextureViewRelease(targetView);
+  // #ifndef __EMSCRIPTEN__
+  //   wgpuSurfacePresent(app->surface);
+  // #endif
 
-#ifndef __EMSCRIPTEN__
-  wgpuSurfacePresent(app->surface);
-#endif
+  // #if defined(WEBGPU_BACKEND_DAWN)
+  //   wgpuDeviceTick(device);
+  // #elif defined(WEBGPU_BACKEND_WGPU)
+  //   wgpuDevicePoll(app->device, false, NULL);
+  // #endif
 
-#if defined(WEBGPU_BACKEND_DAWN)
-  wgpuDeviceTick(device);
-#elif defined(WEBGPU_BACKEND_WGPU)
-  wgpuDevicePoll(app->device, false, NULL);
-#endif
+  //   if (app->shouldStop) {
+  // #if defined(WEBGPU_BACKEND_EMSCRIPTEN)
+  //     for (int i = 0; i < 5; ++i) {
+  //       emscripten_sleep(10);
+  //     }
+  // #endif
+  //     wgpuRenderPipelineRelease(pipeline);
+  //     WG_Destroy();
+  //   }
 
-  if (app->shouldStop) {
-#if defined(WEBGPU_BACKEND_EMSCRIPTEN)
-    for (int i = 0; i < 5; ++i) {
-      emscripten_sleep(10);
-    }
-#endif
-    wgpuRenderPipelineRelease(pipeline);
-    WG_Destroy();
-  }
-
-  // return !app->shouldStop;
-  return false;
+  //   // return !app->shouldStop;
+  //   return false;
 }
 int main(int argc, char *argv[]) {
   main_SDL(argc, argv);
-
-  printf("WG start\n");
-  WG *app = WG_Instance();
-  WG_Init();
-  printf("WG Init success!\n");
 
   const char *shaderSource = "@vertex \
       fn vs_main(@builtin(vertex_index) in_vertex_index: u32) ->  \
@@ -132,18 +127,18 @@ int main(int argc, char *argv[]) {
           var c = vec3f(0.0, 0.5, 0.7); \
           return vec4f(pow(c, vec3f(2.2)), 1.0); \
       }";
-  WGPUShaderModule module = WG_CreateShaderModule(shaderSource);
-  assert(module);
-  pipeline = WG_CreateRenderPipeline(module, "vs_main", "fs_main");
-  wgpuShaderModuleRelease(module);
+  // WGPUShaderModule module = WG_CreateShaderModule(shaderSource);
+  // assert(module);
+  // pipeline = WG_CreateRenderPipeline(module, "vs_main", "fs_main");
+  // wgpuShaderModuleRelease(module);
 
-#ifdef __EMSCRIPTEN__
-  emscripten_sleep(100);
+  // #ifdef __EMSCRIPTEN__
+  //   emscripten_sleep(100);
 
-  emscripten_request_animation_frame_loop(frame, NULL);
-#else
-  while (!app->shouldStop)
-    frame(0.0, NULL);
-#endif
-  return 0;
+  //   emscripten_request_animation_frame_loop(frame, NULL);
+  // #else
+  //   while (!app->shouldStop)
+  //     frame(0.0, NULL);
+  // #endif
+  //   return 0;
 }

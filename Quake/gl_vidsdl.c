@@ -26,6 +26,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "cfgfile.h"
 #include "bgmusic.h"
 #include "resource.h"
+
 #if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)
 #include <SDL2/SDL.h>
 #else
@@ -66,7 +67,8 @@ int nummodes;
 static qboolean vid_initialized = false;
 
 static SDL_Window *draw_context;
-static SDL_GLContext gl_context;
+// static SDL_GLContext gl_context;
+
 static SDL_Cursor *cursor_arrow;
 static SDL_Cursor *cursor_hand;
 static SDL_Cursor *cursor_ibeam;
@@ -423,8 +425,8 @@ static qboolean VID_SetMode(int width, int height, int refreshrate,
   /* z-buffer depth */
   depthbits = 24;
   stencilbits = 8;
-  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, depthbits);
-  SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, stencilbits);
+  // SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, depthbits);
+  // SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, stencilbits);
 
   q_snprintf(caption, sizeof(caption), WINDOW_TITLE_STRING);
 
@@ -435,18 +437,22 @@ static qboolean VID_SetMode(int width, int height, int refreshrate,
     if (vid_borderless.value)
       flags |= SDL_WINDOW_BORDERLESS;
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, MIN_GL_VERSION_MAJOR);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, MIN_GL_VERSION_MINOR);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                        SDL_GL_CONTEXT_PROFILE_CORE);
-#ifndef NDEBUG
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
-#endif
+    //     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,
+    //     MIN_GL_VERSION_MAJOR);
+    //     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,
+    //     MIN_GL_VERSION_MINOR);
+    //     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+    //                         SDL_GL_CONTEXT_PROFILE_CORE);
+    // #ifndef NDEBUG
+    //     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+    // #endif
     draw_context =
         SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED,
                          SDL_WINDOWPOS_UNDEFINED, width, height, flags);
-    if (!draw_context) { // scale back SDL_GL_DEPTH_SIZE
-      SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+    if (!draw_context) { // scale back SDL_GL_DEPTH_SIZE (eli note: i think this
+                         // is not needed on modern systems, can probably jsut
+                         // delete)
+      // SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
       draw_context =
           SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED,
                            SDL_WINDOWPOS_UNDEFINED, width, height, flags);
@@ -494,42 +500,7 @@ static qboolean VID_SetMode(int width, int height, int refreshrate,
   SDL_ShowWindow(draw_context);
   SDL_RaiseWindow(draw_context);
 
-  /* Create GL context if needed */
-  if (!gl_context) {
-    gl_context = SDL_GL_CreateContext(draw_context);
-    if (!gl_context) {
-      // Couldn't create an OpenGL context with our minimum requirements.
-      // Try again with the default attributes and see what we get,
-      // so we have more meaningful information for the error message.
-      int major, minor;
-      const char *version;
-
-      SDL_GL_ResetAttributes();
-      gl_context = SDL_GL_CreateContext(draw_context);
-      version = gl_context ? (const char *)glGetString(GL_VERSION) : NULL;
-      if (!version || sscanf(version, "%d.%d", &major, &minor) != 2)
-        major = minor = 0;
-
-      if (major && MAKE_GL_VERSION(major, minor) < MIN_GL_VERSION)
-        Sys_Error("This engine requires OpenGL %d.%d, but only version %d.%d "
-                  "was found.\n"
-                  "Please make sure that your GPU (%s) meets the minimum "
-                  "requirements and that the graphics drivers are up to date.",
-                  MIN_GL_VERSION_MAJOR, MIN_GL_VERSION_MINOR, major, minor,
-                  (const char *)glGetString(GL_RENDERER));
-      else if (gl_context)
-        Sys_Error("Could not create OpenGL %d.%d context.\n"
-                  "Please make sure that your GPU (%s) meets the minimum "
-                  "requirements and that the graphics drivers are up to date.",
-                  MIN_GL_VERSION_MAJOR, MIN_GL_VERSION_MINOR,
-                  (const char *)glGetString(GL_RENDERER));
-      else
-        Sys_Error("Could not create OpenGL %d.%d context. " // no newline
-                  "Please make sure that your GPU meets the minimum "
-                  "requirements and that the graphics drivers are up to date.",
-                  MIN_GL_VERSION_MAJOR, MIN_GL_VERSION_MINOR);
-    }
-  }
+  WG_Init(draw_context); // this prints on error
 
   vid.width = VID_GetCurrentWidth();
   vid.height = VID_GetCurrentHeight();
@@ -540,14 +511,6 @@ static qboolean VID_SetMode(int width, int height, int refreshrate,
   vid.numpages = 2;
 
   VID_RecalcInterfaceSize();
-
-  // read the obtained z-buffer depth
-  if (SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &depthbits) == -1)
-    depthbits = 0;
-
-  // read stencil bits
-  if (SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &gl_stencilbits) == -1)
-    gl_stencilbits = 0;
 
   modestate = VID_GetFullscreen() ? MS_FULLSCREEN : MS_WINDOWED;
 
@@ -584,12 +547,12 @@ static void VID_ApplyVSync(void) {
                    abs(interval), MAX_INTERVAL);
     interval = interval < 0 ? -MAX_INTERVAL : MAX_INTERVAL;
   }
-  if (SDL_GL_SetSwapInterval(interval) != 0) {
-    if (interval == 0)
-      Con_SafePrintf("Could not disable vsync\n");
-    else
-      Con_SafePrintf("Could not set vsync interval to %d\n", interval);
-  }
+  // if (SDL_GL_SetSwapInterval(interval) != 0) {
+  //   if (interval == 0)
+  //     Con_SafePrintf("Could not disable vsync\n");
+  //   else
+  //     Con_SafePrintf("Could not set vsync interval to %d\n", interval);
+  // }
 }
 
 /*
@@ -965,21 +928,21 @@ GL_InitFunctions
 ===============
 */
 qboolean GL_InitFunctions(const glfunc_t *funcs, qboolean required) {
-  qboolean ret = true;
+  // qboolean ret = true;
 
-  while (funcs->name) {
-    if ((*funcs->ptr = SDL_GL_GetProcAddress(funcs->name)) == NULL) {
-      if (required) {
-        Sys_Error("OpenGL function %s not found\n", funcs->name);
-      } else {
-        Con_Warning("OpenGL function %s not found\n", funcs->name);
-        ret = false;
-      }
-    }
-    funcs++;
-  }
+  // while (funcs->name) {
+  //   if ((*funcs->ptr = SDL_GL_GetProcAddress(funcs->name)) == NULL) {
+  //     if (required) {
+  //       Sys_Error("OpenGL function %s not found\n", funcs->name);
+  //     } else {
+  //       Con_Warning("OpenGL function %s not found\n", funcs->name);
+  //       ret = false;
+  //     }
+  //   }
+  //   funcs++;
+  // }
 
-  return ret;
+  // return ret;
 }
 
 /*
@@ -1318,21 +1281,21 @@ void GL_EndRendering(void) {
   GL_PostProcess();
   GL_ReleaseFrameResources();
 
-  if (!scr_skipupdate) {
-    SDL_GL_SwapWindow(draw_context);
-  }
+  // if (!scr_skipupdate) {
+  //   SDL_GL_SwapWindow(draw_context);
+  // }
 }
 
 void VID_Shutdown(void) {
   if (vid_initialized) {
     VID_FreeMouseCursors();
-    SDL_GL_DeleteContext(gl_context);
-    gl_context = NULL;
+
+    WG_Destroy();
+
     SDL_DestroyWindow(draw_context);
     draw_context = NULL;
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
     draw_context = NULL;
-    gl_context = NULL;
     PL_VID_Shutdown();
   }
 }
@@ -1641,8 +1604,8 @@ void VID_Init(void) {
 
   PL_SetWindowIcon();
 
-  GL_Init();
-  GL_SetupState();
+  // GL_Init();
+  // GL_SetupState();
   cmd = Cmd_AddCommand("gl_info", GL_Info_f); // johnfitz
   if (cmd)
     cmd->completion = GL_Info_Completion_f;
