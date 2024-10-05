@@ -161,100 +161,100 @@ static const char warpscale_fragment_shader[] =
 
 ////////////////////////////////////////////////////////////////
 
-#define NOISE_FUNCTIONS                                                        \
-  "// ALU-only 16x16 Bayer matrix\n"                                           \
-  "float bayer01(ivec2 coord)\n"                                               \
-  "{\n"                                                                        \
-  "	coord &= 15;\n"                                                            \
-  "	coord.y ^= coord.x;\n"                                                     \
-  "	uint v = uint(coord.y | (coord.x << 8));	// 0  0  0  0 | x3 "              \
-  "x2 x1 x0 |  0  0  0  0 | y3 y2 y1 y0\n"                                     \
-  "	v = (v ^ (v << 2)) & 0x3333;				// 0  0 x3 "                               \
-  "x2 |  0  0 x1 x0 |  0  0 y3 y2 |  0  0 y1 y0\n"                             \
-  "	v = (v ^ (v << 1)) & 0x5555;				// 0 x3  0 "                               \
-  "x2 |  0 x1  0 x0 |  0 y3  0 y2 |  0 y1  0 y0\n"                             \
-  "	v |= v >> 7;							"                                                       \
-  "	// 0 x3  0 x2 |  0 x1  0 x0 | x3 y3 x2 y2 | x1 y1 x0 y0\n"                 \
-  "	v = bitfieldReverse(v) >> 24;				// 0  0  0  "                             \
-  "0 |  0  0  0  0 | y0 x0 y1 x1 | y2 x2 y3 x3\n"                              \
-  "	return float(v) * (1.0/256.0);\n"                                          \
-  "}\n"                                                                        \
-  "\n"                                                                         \
-  "float bayer(ivec2 coord)\n"                                                 \
-  "{\n"                                                                        \
-  "	return bayer01(coord) - 0.5;\n"                                            \
-  "}\n"                                                                        \
-  "\n"                                                                         \
-  "// Hash without Sine\n"                                                     \
-  "// https://www.shadertoy.com/view/4djSRW \n" /* Copyright (c)2014 David     \
-                                                Hoskins.                       \
-                                                                               \
-                                                Permission is hereby granted,  \
-                                                free of charge, to any person  \
-                                                obtaining a copy of this                                                                       \
-                                                software and associated        \
-                                                documentation files (the       \
-                                                "Software"), to deal in the                                                                        \
-                                                Software without restriction,  \
-                                                including without limitation   \
-                                                the rights to use, copy,                                                                 \
-                                                modify, merge, publish,        \
-                                                distribute, sublicense, and/or \
-                                                sell copies of the Software,                                                       \
-                                                and to permit persons to whom  \
-                                                the Software is furnished to                                                                  \
-                                                do so, subject to the          \
-                                                following conditions:          \
-                                                                               \
-                                                The above copyright notice and \
-                                                this permission notice shall   \
-                                                be included in all copies or                                                                     \
-                                                substantial portions of the    \
-                                                Software.                      \
-                                                                               \
-                                                THE SOFTWARE IS PROVIDED "AS   \
-                                                IS", WITHOUT WARRANTY OF ANY   \
-                                                KIND, EXPRESS OR IMPLIED,                                                                      \
-                                                INCLUDING BUT NOT LIMITED TO   \
-                                                THE WARRANTIES OF              \
-                                                MERCHANTABILITY, FITNESS FOR A                                                                 \
-                                                PARTICULAR PURPOSE AND         \
-                                                NONINFRINGEMENT. IN NO EVENT   \
-                                                SHALL THE AUTHORS OR COPYRIGHT                                                          \
-                                                HOLDERS BE LIABLE FOR ANY      \
-                                                CLAIM, DAMAGES OR OTHER        \
-                                                LIABILITY, WHETHER IN AN       \
-                                                ACTION OF CONTRACT, TORT OR    \
-                                                OTHERWISE, ARISING FROM, OUT                                                                           \
-                                                OF OR IN CONNECTION WITH THE   \
-                                                SOFTWARE OR THE USE OR OTHER   \
-                                                DEALINGS IN THE SOFTWARE.*/                                                                   \
-  "float whitenoise01(vec2 p)\n"                                               \
-  "{\n"                                                                        \
-  "	vec3 p3 = fract(vec3(p.xyx) * .1031);\n"                                   \
-  "	p3 += dot(p3, p3.yzx + 33.33);\n"                                          \
-  "	return fract((p3.x + p3.y) * p3.z);\n"                                     \
-  "}\n"                                                                        \
-  "\n"                                                                         \
-  "float whitenoise(vec2 p)\n"                                                 \
-  "{\n"                                                                        \
-  "	return whitenoise01(p) - 0.5;\n"                                           \
-  "}\n"                                                                        \
-  "\n"                                                                         \
-  "// Convert uniform distribution to triangle-shaped distribution\n"          \
-  "// Input in [0..1], output in [-1..1]\n"                                    \
-  "// Based on https://www.shadertoy.com/view/4t2SDh \n"                       \
-  "float tri(float x)\n"                                                       \
-  "{\n"                                                                        \
-  "	float orig = x * 2.0 - 1.0;\n"                                             \
-  "	uint signbit = floatBitsToUint(orig) & 0x80000000u;\n"                     \
-  "	x = sqrt(abs(orig)) - 1.;\n"                                               \
-  "	x = uintBitsToFloat(floatBitsToUint(x) ^ signbit);\n"                      \
-  "	return x;\n"                                                               \
-  "}\n"                                                                        \
-  "\n"                                                                         \
-  "#define DITHER_NOISE(uv) tri(bayer01(ivec2(uv)))\n"                         \
-  "#define SCREEN_SPACE_NOISE() DITHER_NOISE(floor(gl_FragCoord.xy)+0.5)\n"    \
+#define NOISE_FUNCTIONS                                                          \
+  "// ALU-only 16x16 Bayer matrix\n"                                             \
+  "float bayer01(ivec2 coord)\n"                                                 \
+  "{\n"                                                                          \
+  "	coord &= 15;\n"                                                              \
+  "	coord.y ^= coord.x;\n"                                                       \
+  "	uint v = uint(coord.y | (coord.x << 8));	// 0  0  0  0 | x3 "                \
+  "x2 x1 x0 |  0  0  0  0 | y3 y2 y1 y0\n"                                       \
+  "	v = (v ^ (v << 2)) & 0x3333;				// 0  0 x3 "                                 \
+  "x2 |  0  0 x1 x0 |  0  0 y3 y2 |  0  0 y1 y0\n"                               \
+  "	v = (v ^ (v << 1)) & 0x5555;				// 0 x3  0 "                                 \
+  "x2 |  0 x1  0 x0 |  0 y3  0 y2 |  0 y1  0 y0\n"                               \
+  "	v |= v >> 7;							"                                                         \
+  "	// 0 x3  0 x2 |  0 x1  0 x0 | x3 y3 x2 y2 | x1 y1 x0 y0\n"                   \
+  "	v = bitfieldReverse(v) >> 24;				// 0  0  0  "                               \
+  "0 |  0  0  0  0 | y0 x0 y1 x1 | y2 x2 y3 x3\n"                                \
+  "	return float(v) * (1.0/256.0);\n"                                            \
+  "}\n"                                                                          \
+  "\n"                                                                           \
+  "float bayer(ivec2 coord)\n"                                                   \
+  "{\n"                                                                          \
+  "	return bayer01(coord) - 0.5;\n"                                              \
+  "}\n"                                                                          \
+  "\n"                                                                           \
+  "// Hash without Sine\n"                                                       \
+  "// https://www.shadertoy.com/view/4djSRW \n" /* Copyright (c)2014 David       \
+                                                Hoskins.                         \
+                                                                               \ \
+                                                Permission is hereby granted,    \
+                                                free of charge, to any person    \
+                                                obtaining a copy of this         \
+                                                software and associated          \
+                                                documentation files (the         \
+                                                "Software"), to deal in the      \
+                                                Software without restriction,    \
+                                                including without limitation     \
+                                                the rights to use, copy,         \
+                                                modify, merge, publish,          \
+                                                distribute, sublicense, and/or   \
+                                                sell copies of the Software,     \
+                                                and to permit persons to whom    \
+                                                the Software is furnished to     \
+                                                do so, subject to the            \
+                                                following conditions:            \
+                                                                               \ \
+                                                The above copyright notice and   \
+                                                this permission notice shall     \
+                                                be included in all copies or     \
+                                                substantial portions of the      \
+                                                Software.                        \
+                                                                               \ \
+                                                THE SOFTWARE IS PROVIDED "AS     \
+                                                IS", WITHOUT WARRANTY OF ANY     \
+                                                KIND, EXPRESS OR IMPLIED,        \
+                                                INCLUDING BUT NOT LIMITED TO     \
+                                                THE WARRANTIES OF                \
+                                                MERCHANTABILITY, FITNESS FOR A   \
+                                                PARTICULAR PURPOSE AND           \
+                                                NONINFRINGEMENT. IN NO EVENT     \
+                                                SHALL THE AUTHORS OR COPYRIGHT   \
+                                                HOLDERS BE LIABLE FOR ANY        \
+                                                CLAIM, DAMAGES OR OTHER          \
+                                                LIABILITY, WHETHER IN AN         \
+                                                ACTION OF CONTRACT, TORT OR      \
+                                                OTHERWISE, ARISING FROM, OUT     \
+                                                OF OR IN CONNECTION WITH THE     \
+                                                SOFTWARE OR THE USE OR OTHER     \
+                                                DEALINGS IN THE SOFTWARE.*/      \
+  "float whitenoise01(vec2 p)\n"                                                 \
+  "{\n"                                                                          \
+  "	vec3 p3 = fract(vec3(p.xyx) * .1031);\n"                                     \
+  "	p3 += dot(p3, p3.yzx + 33.33);\n"                                            \
+  "	return fract((p3.x + p3.y) * p3.z);\n"                                       \
+  "}\n"                                                                          \
+  "\n"                                                                           \
+  "float whitenoise(vec2 p)\n"                                                   \
+  "{\n"                                                                          \
+  "	return whitenoise01(p) - 0.5;\n"                                             \
+  "}\n"                                                                          \
+  "\n"                                                                           \
+  "// Convert uniform distribution to triangle-shaped distribution\n"            \
+  "// Input in [0..1], output in [-1..1]\n"                                      \
+  "// Based on https://www.shadertoy.com/view/4t2SDh \n"                         \
+  "float tri(float x)\n"                                                         \
+  "{\n"                                                                          \
+  "	float orig = x * 2.0 - 1.0;\n"                                               \
+  "	uint signbit = floatBitsToUint(orig) & 0x80000000u;\n"                       \
+  "	x = sqrt(abs(orig)) - 1.;\n"                                                 \
+  "	x = uintBitsToFloat(floatBitsToUint(x) ^ signbit);\n"                        \
+  "	return x;\n"                                                                 \
+  "}\n"                                                                          \
+  "\n"                                                                           \
+  "#define DITHER_NOISE(uv) tri(bayer01(ivec2(uv)))\n"                           \
+  "#define SCREEN_SPACE_NOISE() DITHER_NOISE(floor(gl_FragCoord.xy)+0.5)\n"      \
   "#define SUPPRESS_BANDING() bayer(ivec2(gl_FragCoord.xy))\n"
 
 ////////////////////////////////////////////////////////////////

@@ -99,34 +99,6 @@ GLint ssbo_align;
 GLint ubo_align;
 static GLuint globalvao;
 
-#define QGL_DEFINE_FUNC(ret, name, args)                                       \
-  ret(APIENTRYP GL_##name##Func) args = NULL;
-QGL_ALL_FUNCTIONS(QGL_DEFINE_FUNC)
-#undef QGL_DEFINE_FUNC
-
-typedef struct glfunc_t {
-  void **ptr;
-  const char *name;
-} glfunc_t;
-
-#define QGL_REGISTER_NAMED_FUNC(ret, name, args)                               \
-  {(void **)&GL_##name##Func, "gl" #name},
-static const glfunc_t gl_core_functions[] = {
-    QGL_CORE_FUNCTIONS(QGL_REGISTER_NAMED_FUNC){NULL, NULL}};
-
-static const glfunc_t gl_arb_buffer_storage_functions[] = {
-    QGL_ARB_buffer_storage_FUNCTIONS(QGL_REGISTER_NAMED_FUNC){NULL, NULL}};
-
-static const glfunc_t gl_arb_multi_bind_functions[] = {
-    QGL_ARB_multi_bind_FUNCTIONS(QGL_REGISTER_NAMED_FUNC){NULL, NULL}};
-
-static const glfunc_t gl_arb_bindless_texture_functions[] = {
-    QGL_ARB_bindless_texture_FUNCTIONS(QGL_REGISTER_NAMED_FUNC){NULL, NULL}};
-
-static const glfunc_t gl_arb_clip_control_functions[] = {
-    QGL_ARB_clip_control_FUNCTIONS(QGL_REGISTER_NAMED_FUNC){NULL, NULL}};
-#undef QGL_REGISTER_NAMED_FUNC
-
 //====================================
 
 // johnfitz -- new cvars

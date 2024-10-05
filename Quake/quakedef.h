@@ -262,7 +262,6 @@ typedef struct {
 
 #include "platform.h"
 #include <SDL2/SDL.h>
-#include <SDL2/SDL_opengl.h>
 #ifndef APIENTRY
 #define APIENTRY
 #endif

@@ -105,8 +105,10 @@ int WG_Init(SDL_Window *window) {
   wgpu.surface = SDL_GetWGPUSurface(wgpu.instance, wgpu.window);
 
   WGPURequestAdapterOptions adapterOpt = {
+      .nextInChain = NULL,
       .compatibleSurface = wgpu.surface,
-      .powerPreference = WGPUPowerPreference_HighPerformance};
+      .powerPreference = WGPUPowerPreference_HighPerformance,
+  };
 
   wgpu.adapter = requestAdapterSync(wgpu.instance, &adapterOpt);
   if (!wgpu.adapter) {
