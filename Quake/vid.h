@@ -26,80 +26,75 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 // vid.h -- video driver defs
 
-#define VID_CBITS	6
-#define VID_GRADES	(1 << VID_CBITS)
+#define VID_CBITS 6
+#define VID_GRADES (1 << VID_CBITS)
 
-#define GAMMA_MAX	3.0
+#define GAMMA_MAX 3.0
 
 // moved here for global use -- kristian
 typedef enum { MS_UNINIT, MS_WINDOWED, MS_FULLSCREEN } modestate_t;
 
-extern modestate_t	modestate;
+extern modestate_t modestate;
 
 // a pixel can be one, two, or four bytes
 typedef byte pixel_t;
 
-typedef struct vrect_s
-{
-	int	x, y, width, height;
+typedef struct vrect_s {
+  int x, y, width, height;
 } vrect_t;
 
-typedef struct
-{
-	pixel_t		*colormap;	// 256 * VID_GRADES size
-	int			fullbright;	// index of first fullbright color
-	int			rowbytes;	// may be > width if displayed in a window
-	int			width;
-	int			height;
-	qboolean	resized;
-	int			maxscale;		// maximum r_scale value, based on height
-	int			refreshrate;
-	int			numpages;
-	int			recalc_refdef;	// if true, recalc vid-based stuff
-	int			conrowbytes;
-	int			conwidth;
-	int			conheight;
-	float		guipixelaspect;	// 2D pixel aspect ratio (1 = square)
-	int			guiwidth;		// 2D width
-	int			guiheight;		// 2D height
+typedef struct {
+  pixel_t *colormap; // 256 * VID_GRADES size
+  int fullbright;    // index of first fullbright color
+  int rowbytes;      // may be > width if displayed in a window
+  int width;
+  int height;
+  qboolean resized;
+  int maxscale; // maximum r_scale value, based on height
+  int refreshrate;
+  int numpages;
+  int recalc_refdef; // if true, recalc vid-based stuff
+  int conrowbytes;
+  int conwidth;
+  int conheight;
+  float guipixelaspect; // 2D pixel aspect ratio (1 = square)
+  int guiwidth;         // 2D width
+  int guiheight;        // 2D height
 } viddef_t;
 
-extern	viddef_t	vid;				// global video state
+extern viddef_t vid; // global video state
 
-typedef struct
-{
-	int			width;
-	int			height;
-	int			refreshrate;
-	int			bpp;
+typedef struct {
+  int width;
+  int height;
+  int refreshrate;
+  int bpp;
 } vmode_t;
 
-#define MAX_MODE_LIST	600 //johnfitz -- was 30
+#define MAX_MODE_LIST 600 // johnfitz -- was 30
 
-extern	vmode_t	modelist[MAX_MODE_LIST];
-extern	int		nummodes;
+extern vmode_t modelist[MAX_MODE_LIST];
+extern int nummodes;
 
-void	VID_Init (void); //johnfitz -- removed palette from argument list
-void	VID_Shutdown (void); // Called at shutdown
+void VID_Init(void);     // johnfitz -- removed palette from argument list
+void VID_Shutdown(void); // Called at shutdown
 
-void	VID_SyncCvars (void);
-void	VID_Toggle (void);
+void VID_SyncCvars(void);
+void VID_Toggle(void);
 
-typedef enum
-{
-	MOUSECURSOR_DEFAULT,
-	MOUSECURSOR_HAND,
-	MOUSECURSOR_IBEAM,
+typedef enum {
+  MOUSECURSOR_DEFAULT,
+  MOUSECURSOR_HAND,
+  MOUSECURSOR_IBEAM,
 } mousecursor_t;
 
-void		*VID_GetWindow (void);
-qboolean	VID_HasMouseOrInputFocus (void);
-qboolean	VID_IsMinimized (void);
-void		VID_Lock (void);
-void		VID_SetWindowTitle (const char *title);
-void		VID_SetMouseCursor (mousecursor_t cursor);
-void		VID_RecalcConsoleSize (void);
-void		VID_RecalcInterfaceSize (void);
+void *VID_GetWindow(void);
+qboolean VID_HasMouseOrInputFocus(void);
+qboolean VID_IsMinimized(void);
+void VID_Lock(void);
+void VID_SetWindowTitle(const char *title);
+void VID_SetMouseCursor(mousecursor_t cursor);
+void VID_RecalcConsoleSize(void);
+void VID_RecalcInterfaceSize(void);
 
-#endif	/* __VID_DEFS_H */
-
+#endif /* __VID_DEFS_H */

@@ -17,36 +17,18 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-
 #include "quakedef.h"
 
-int CDAudio_Play(byte track, qboolean looping)
-{
-	return -1;
-}
+int CDAudio_Play(byte track, qboolean looping) { return -1; }
 
-void CDAudio_Stop(void)
-{
-}
+void CDAudio_Stop(void) {}
 
-void CDAudio_Pause(void)
-{
-}
+void CDAudio_Pause(void) {}
 
-void CDAudio_Resume(void)
-{
-}
+void CDAudio_Resume(void) {}
 
-void CDAudio_Update(void)
-{
-}
+void CDAudio_Update(void) {}
 
-int CDAudio_Init(void)
-{
-	return -1;
-}
+int CDAudio_Init(void) { return -1; }
 
-void CDAudio_Shutdown(void)
-{
-}
-
+void CDAudio_Shutdown(void) {}
