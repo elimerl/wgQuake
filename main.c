@@ -37,7 +37,7 @@ bool frame(double time, void *userdata) {
   if (!targetView)
     app->shouldStop = true;
 
-  WGPUCommandEncoderDescriptor encoderDesc = {};
+  WGPUCommandEncoderDescriptor encoderDesc;
   encoderDesc.nextInChain = NULL;
   WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(app->device, &encoderDesc);
@@ -71,7 +71,7 @@ bool frame(double time, void *userdata) {
   wgpuRenderPassEncoderEnd(renderPass);
   wgpuRenderPassEncoderRelease(renderPass);
 
-  WGPUCommandBufferDescriptor cmdBufferDescriptor = {};
+  WGPUCommandBufferDescriptor cmdBufferDescriptor;
   cmdBufferDescriptor.nextInChain = NULL;
   WGPUCommandBuffer command =
       wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);

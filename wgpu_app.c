@@ -53,7 +53,7 @@ int WG_Init() {
     return 1;
   }
 
-  WGPUDeviceDescriptor deviceDesc = {};
+  WGPUDeviceDescriptor deviceDesc;
   app.device = requestDeviceSync(app.adapter, &deviceDesc);
 
   if (!app.device) {

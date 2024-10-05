@@ -25,10 +25,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "net_sys.h"
 #include "net_defs.h"
 
-#ifndef WITHOUT_CURL
-#include <curl/curl.h>
-#endif
-
 qsocket_t *net_activeSockets = NULL;
 qsocket_t *net_freeSockets = NULL;
 int net_numsockets = 0;
