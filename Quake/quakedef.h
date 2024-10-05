@@ -261,13 +261,8 @@ typedef struct {
 #include "crc.h"
 
 #include "platform.h"
-#if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
-#else
-#include "SDL.h"
-#include "SDL_opengl.h"
-#endif
 #ifndef APIENTRY
 #define APIENTRY
 #endif
