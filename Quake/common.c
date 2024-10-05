@@ -2688,7 +2688,7 @@ static void COM_InitBaseDir(void) {
   char path[MAX_OSPATH];
   char original[MAX_OSPATH] = {0};
   char remastered[MAX_OSPATH] = {0};
-  int i, steam, gog, egs;
+  int i;
 
   // command-line basedir takes priority over everything else
   i = COM_CheckParm("-basedir");
