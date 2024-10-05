@@ -24,1260 +24,711 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 
-extern cvar_t gl_fullbrights, r_drawflat, gl_overbright, r_oldwater,
-    r_oldskyleaf, r_showtris; // johnfitz
+extern cvar_t gl_fullbrights, r_oldskyleaf, r_showtris; //johnfitz
+extern cvar_t gl_zfix; // QuakeSpasm z-fighting fix
+extern cvar_t r_oit;
 
-byte *SV_FatPVS(vec3_t org, qmodel_t *worldmodel);
+extern gltexture_t *lightmap_texture;
 
-//==============================================================================
-//
-// SETUP CHAINS
-//
-//==============================================================================
-
-/*
-================
-R_ClearTextureChains -- ericw
-
-clears texture chains for all textures used by the given model, and also
-clears the lightmap chains
-================
-*/
-void R_ClearTextureChains(qmodel_t *mod, texchain_t chain) {
-  int i;
-
-  // set all chains to null
-  for (i = 0; i < mod->numtextures; i++)
-    if (mod->textures[i])
-      mod->textures[i]->texturechains[chain] = NULL;
-
-  // clear lightmap chains
-  for (i = 0; i < lightmap_count; i++)
-    lightmaps[i].polys = NULL;
-}
-
-/*
-================
-R_ChainSurface -- ericw -- adds the given surface to its texture chain
-================
-*/
-void R_ChainSurface(msurface_t *surf, texchain_t chain) {
-  surf->texturechain = surf->texinfo->texture->texturechains[chain];
-  surf->texinfo->texture->texturechains[chain] = surf;
-}
-
-/*
-================
-R_BackFaceCull -- johnfitz -- returns true if the surface is facing away from
-vieworg
-================
-*/
-qboolean R_BackFaceCull(msurface_t *surf) {
-  double dot;
-
-  if (surf->plane->type < 3)
-    dot = r_refdef.vieworg[surf->plane->type] - surf->plane->dist;
-  else
-    dot = DotProduct(r_refdef.vieworg, surf->plane->normal) - surf->plane->dist;
-
-  if ((dot < 0) ^ !!(surf->flags & SURF_PLANEBACK))
-    return true;
-
-  return false;
-}
-
-/*
-===============
-R_MarkSurfaces -- johnfitz -- mark surfaces based on PVS and rebuild texture
-chains
-===============
-*/
-void R_MarkSurfaces(void) {
-  byte *vis;
-  mleaf_t *leaf;
-  msurface_t *surf, **mark;
-  int i, j;
-  qboolean nearwaterportal;
-
-  // clear lightmap chains
-  for (i = 0; i < lightmap_count; i++)
-    lightmaps[i].polys = NULL;
-
-  // check this leaf for water portals
-  // TODO: loop through all water surfs and use distance to leaf cullbox
-  nearwaterportal = false;
-  for (i = 0, mark = r_viewleaf->firstmarksurface;
-       i < r_viewleaf->nummarksurfaces; i++, mark++)
-    if ((*mark)->flags & SURF_DRAWTURB)
-      nearwaterportal = true;
-
-  // choose vis data
-  if (r_novis.value || r_viewleaf->contents == CONTENTS_SOLID ||
-      r_viewleaf->contents == CONTENTS_SKY)
-    vis = Mod_NoVisPVS(cl.worldmodel);
-  else if (nearwaterportal)
-    vis = SV_FatPVS(r_origin, cl.worldmodel);
-  else
-    vis = Mod_LeafPVS(r_viewleaf, cl.worldmodel);
-
-  r_visframecount++;
-
-  // set all chains to null
-  for (i = 0; i < cl.worldmodel->numtextures; i++)
-    if (cl.worldmodel->textures[i])
-      cl.worldmodel->textures[i]->texturechains[chain_world] = NULL;
-
-  // iterate through leaves, marking surfaces
-  leaf = &cl.worldmodel->leafs[1];
-  for (i = 0; i < cl.worldmodel->numleafs; i++, leaf++) {
-    if (vis[i >> 3] & (1 << (i & 7))) {
-      if (R_CullBox(leaf->minmaxs, leaf->minmaxs + 3))
-        continue;
-
-      if (r_oldskyleaf.value || leaf->contents != CONTENTS_SKY)
-        for (j = 0, mark = leaf->firstmarksurface; j < leaf->nummarksurfaces;
-             j++, mark++) {
-          surf = *mark;
-          if (surf->visframe != r_visframecount) {
-            surf->visframe = r_visframecount;
-            if (!R_CullBox(surf->mins, surf->maxs) && !R_BackFaceCull(surf)) {
-              rs_brushpolys++; // count wpolys here
-              R_ChainSurface(surf, chain_world);
-              R_RenderDynamicLightmaps(surf);
-              if (surf->texinfo->texture->warpimage)
-                surf->texinfo->texture->update_warp = true;
-            }
-          }
-        }
-
-      // add static models
-      if (leaf->efrags)
-        R_StoreEfrags(&leaf->efrags);
-    }
-  }
-}
-
-//==============================================================================
-//
-// DRAW CHAINS
-//
-//==============================================================================
-
-/*
-=============
-R_BeginTransparentDrawing -- ericw
-=============
-*/
-static void R_BeginTransparentDrawing(float entalpha) {
-  if (entalpha < 1.0f) {
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glColor4f(1, 1, 1, entalpha);
-  }
-}
-
-/*
-=============
-R_EndTransparentDrawing -- ericw
-=============
-*/
-static void R_EndTransparentDrawing(float entalpha) {
-  if (entalpha < 1.0f) {
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glColor3f(1, 1, 1);
-  }
-}
-
-/*
-================
-R_DrawTextureChains_ShowTris -- johnfitz
-================
-*/
-void R_DrawTextureChains_ShowTris(qmodel_t *model, texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  glpoly_t *p;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-    if (!t)
-      continue;
-
-    if (r_oldwater.value && t->texturechains[chain] &&
-        (t->texturechains[chain]->flags & SURF_DRAWTURB)) {
-      for (s = t->texturechains[chain]; s; s = s->texturechain)
-        for (p = s->polys->next; p; p = p->next) {
-          DrawGLTriangleFan(p);
-        }
-    } else {
-      for (s = t->texturechains[chain]; s; s = s->texturechain) {
-        DrawGLTriangleFan(s->polys);
-      }
-    }
-  }
-}
-
-/*
-================
-R_DrawTextureChains_Drawflat -- johnfitz
-================
-*/
-void R_DrawTextureChains_Drawflat(qmodel_t *model, texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  glpoly_t *p;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-    if (!t)
-      continue;
-
-    if (r_oldwater.value && t->texturechains[chain] &&
-        (t->texturechains[chain]->flags & SURF_DRAWTURB)) {
-      for (s = t->texturechains[chain]; s; s = s->texturechain)
-        for (p = s->polys->next; p; p = p->next) {
-          srand((unsigned int)(uintptr_t)p);
-          glColor3f(rand() % 256 / 255.0, rand() % 256 / 255.0,
-                    rand() % 256 / 255.0);
-          DrawGLPoly(p);
-          rs_brushpasses++;
-        }
-    } else {
-      for (s = t->texturechains[chain]; s; s = s->texturechain) {
-        srand((unsigned int)(uintptr_t)s->polys);
-        glColor3f(rand() % 256 / 255.0, rand() % 256 / 255.0,
-                  rand() % 256 / 255.0);
-        DrawGLPoly(s->polys);
-        rs_brushpasses++;
-      }
-    }
-  }
-  glColor3f(1, 1, 1);
-  srand((int)(cl.time * 1000));
-}
-
-/*
-================
-R_DrawTextureChains_Glow -- johnfitz
-================
-*/
-void R_DrawTextureChains_Glow(qmodel_t *model, entity_t *ent,
-                              texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  gltexture_t *glt;
-  qboolean bound;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        !(glt =
-              R_TextureAnimation(t, ent != NULL ? ent->frame : 0)->fullbright))
-      continue;
-
-    bound = false;
-
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (!bound) // only bind once we are sure we need this texture
-      {
-        GL_Bind(glt);
-        bound = true;
-      }
-      DrawGLPoly(s->polys);
-      rs_brushpasses++;
-    }
-  }
-}
-
-//==============================================================================
-//
-// VBO SUPPORT
-//
-//==============================================================================
-
-static int R_NumTriangleIndicesForSurf(msurface_t *s) {
-  return 3 * (s->numedges - 2);
-}
-
-/*
-================
-R_TriangleIndicesForSurf
-
-Writes out the triangle indices needed to draw s as a triangle list.
-The number of indices it will write is given by R_NumTriangleIndicesForSurf.
-================
-*/
-static void R_TriangleIndicesForSurf(msurface_t *s, unsigned int *dest) {
-  int i;
-  for (i = 2; i < s->numedges; i++) {
-    *dest++ = s->vbo_firstvert;
-    *dest++ = s->vbo_firstvert + i - 1;
-    *dest++ = s->vbo_firstvert + i;
-  }
-}
-
-#define MAX_BATCH_SIZE 4096
-
-static unsigned int vbo_indices[MAX_BATCH_SIZE];
-static unsigned int num_vbo_indices;
-
-/*
-================
-R_ClearBatch
-================
-*/
-static void R_ClearBatch(void) { num_vbo_indices = 0; }
-
-/*
-================
-R_FlushBatch
-
-Draw the current batch if non-empty and clears it, ready for more R_BatchSurface
-calls.
-================
-*/
-static void R_FlushBatch(void) {
-  if (num_vbo_indices > 0) {
-    glDrawElements(GL_TRIANGLES, num_vbo_indices, GL_UNSIGNED_INT, vbo_indices);
-    num_vbo_indices = 0;
-  }
-}
-
-/*
-================
-R_BatchSurface
-
-Add the surface to the current batch, or just draw it immediately if we're not
-using VBOs.
-================
-*/
-static void R_BatchSurface(msurface_t *s) {
-  int num_surf_indices = R_NumTriangleIndicesForSurf(s);
-
-  if (num_surf_indices <= 0) {
-    //	Con_DWarning ("bad numedges for surface\n");
-    return;
-  }
-
-  if (num_vbo_indices + num_surf_indices > MAX_BATCH_SIZE)
-    R_FlushBatch();
-
-  R_TriangleIndicesForSurf(s, &vbo_indices[num_vbo_indices]);
-  num_vbo_indices += num_surf_indices;
-}
-
-/*
-================
-R_DrawTextureChains_Multitexture -- johnfitz
-================
-*/
-void R_DrawTextureChains_Multitexture(qmodel_t *model, entity_t *ent,
-                                      texchain_t chain) {
-  int i, j;
-  msurface_t *s;
-  texture_t *t;
-  float *v;
-  qboolean bound;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        t->texturechains[chain]->flags &
-            (SURF_DRAWTURB | SURF_DRAWTILED | SURF_NOTEXTURE))
-      continue;
-
-    bound = false;
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (!bound) // only bind once we are sure we need this texture
-      {
-        GL_Bind(
-            (R_TextureAnimation(t, ent != NULL ? ent->frame : 0))->gltexture);
-
-        if (t->texturechains[chain]->flags & SURF_DRAWFENCE)
-          glEnable(GL_ALPHA_TEST); // Flip alpha test back on
-
-        GL_EnableMultitexture(); // selects TEXTURE1
-        bound = true;
-      }
-      GL_Bind(lightmaps[s->lightmaptexturenum].texture);
-      glBegin(GL_POLYGON);
-      v = s->polys->verts[0];
-      for (j = 0; j < s->polys->numverts; j++, v += VERTEXSIZE) {
-        GL_MTexCoord2fFunc(GL_TEXTURE0_ARB, v[3], v[4]);
-        GL_MTexCoord2fFunc(GL_TEXTURE1_ARB, v[5], v[6]);
-        glVertex3fv(v);
-      }
-      glEnd();
-      rs_brushpasses++;
-    }
-    GL_DisableMultitexture(); // selects TEXTURE0
-
-    if (bound && t->texturechains[chain]->flags & SURF_DRAWFENCE)
-      glDisable(GL_ALPHA_TEST); // Flip alpha test back off
-  }
-}
-
-/*
-================
-R_DrawTextureChains_NoTexture -- johnfitz
-
-draws surfs whose textures were missing from the BSP
-================
-*/
-void R_DrawTextureChains_NoTexture(qmodel_t *model, texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  qboolean bound;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        !(t->texturechains[chain]->flags & SURF_NOTEXTURE))
-      continue;
-
-    bound = false;
-
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (!bound) // only bind once we are sure we need this texture
-      {
-        GL_Bind(t->gltexture);
-        bound = true;
-      }
-      DrawGLPoly(s->polys);
-      rs_brushpasses++;
-    }
-  }
-}
-
-/*
-================
-R_DrawTextureChains_TextureOnly -- johnfitz
-================
-*/
-void R_DrawTextureChains_TextureOnly(qmodel_t *model, entity_t *ent,
-                                     texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  qboolean bound;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        t->texturechains[chain]->flags & (SURF_DRAWTURB | SURF_DRAWSKY))
-      continue;
-
-    bound = false;
-
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (!bound) // only bind once we are sure we need this texture
-      {
-        GL_Bind(
-            (R_TextureAnimation(t, ent != NULL ? ent->frame : 0))->gltexture);
-
-        if (t->texturechains[chain]->flags & SURF_DRAWFENCE)
-          glEnable(GL_ALPHA_TEST); // Flip alpha test back on
-
-        bound = true;
-      }
-      DrawGLPoly(s->polys);
-      rs_brushpasses++;
-    }
-
-    if (bound && t->texturechains[chain]->flags & SURF_DRAWFENCE)
-      glDisable(GL_ALPHA_TEST); // Flip alpha test back off
-  }
-}
-
-/*
-================
-GL_WaterAlphaForEntitySurface -- ericw
-
-Returns the water alpha to use for the entity and surface combination.
-================
-*/
-float GL_WaterAlphaForEntitySurface(entity_t *ent, msurface_t *s) {
-  float entalpha;
-  if (ent == NULL || ent->alpha == ENTALPHA_DEFAULT)
-    entalpha = GL_WaterAlphaForSurface(s);
-  else
-    entalpha = ENTALPHA_DECODE(ent->alpha);
-  return entalpha;
-}
-
-static GLuint r_world_program;
 extern GLuint gl_bmodel_vbo;
+extern size_t gl_bmodel_vbo_size;
+extern GLuint gl_bmodel_ibo;
+extern size_t gl_bmodel_ibo_size;
+extern GLuint gl_bmodel_indirect_buffer;
+extern size_t gl_bmodel_indirect_buffer_size;
+extern GLuint gl_bmodel_leaf_buffer;
+extern GLuint gl_bmodel_surf_buffer;
+extern GLuint gl_bmodel_marksurf_buffer;
 
-// uniforms used in vert shader
+typedef struct gpumark_frame_s {
+	vec4_t		frustum[4];
+	vec3_t		vieworg;
+	GLuint		oldskyleaf;
+	GLuint		framecount;
+	GLuint		padding[3];
+} gpumark_frame_t;
 
-// uniforms used in frag shader
-static GLint texLoc;
-static GLint LMTexLoc;
-static GLint fullbrightTexLoc;
-static GLint useFullbrightTexLoc;
-static GLint useOverbrightLoc;
-static GLint useAlphaTestLoc;
-static GLint useLightmapWideLoc;
-static GLint useLightmapOnlyLoc;
-static GLint alphaLoc;
-
-#define vertAttrIndex 0
-#define texCoordsAttrIndex 1
-#define LMCoordsAttrIndex 2
+byte *SV_FatPVS (vec3_t org, qmodel_t *worldmodel);
 
 /*
-================
-R_DrawTextureChains_Water -- johnfitz
-================
+===============
+R_MarkVisSurfaces
+===============
 */
-void R_DrawTextureChains_Water(qmodel_t *model, entity_t *ent,
-                               texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  glpoly_t *p;
-  qboolean bound;
-  float entalpha;
-  int lastlightmap;
-  qboolean has_lit_water;
-  qboolean has_unlit_water;
+static void R_MarkVisSurfaces (byte* vis)
+{
+	int			i;
+	GLuint		buf;
+	GLbyte*		ofs;
+	size_t		vissize = (cl.worldmodel->numleafs + 7) >> 3;
+	gpumark_frame_t frame;
 
-  if (r_drawflat_cheatsafe ||
-      r_lightmap_cheatsafe) // ericw -- !r_drawworld_cheatsafe check moved to
-                            // R_DrawWorld_Water ()
-    return;
+	GL_BeginGroup ("Mark surfaces");
 
-  has_lit_water = false;
-  has_unlit_water = false;
+	for (i = 0; i < 4; i++)
+	{
+		frame.frustum[i][0] = frustum[i].normal[0];
+		frame.frustum[i][1] = frustum[i].normal[1];
+		frame.frustum[i][2] = frustum[i].normal[2];
+		frame.frustum[i][3] = frustum[i].dist;
+	}
+	frame.vieworg[0] = r_refdef.vieworg[0];
+	frame.vieworg[1] = r_refdef.vieworg[1];
+	frame.vieworg[2] = r_refdef.vieworg[2];
+	frame.oldskyleaf = r_oldskyleaf.value != 0.f;
+	frame.framecount = r_framecount;
 
-  if (r_oldwater.value) {
-    for (i = 0; i < model->numtextures; i++) {
-      t = model->textures[i];
-      if (!t || !t->texturechains[chain] ||
-          !(t->texturechains[chain]->flags & SURF_DRAWTURB))
-        continue;
-      bound = false;
-      entalpha = 1.0f;
-      for (s = t->texturechains[chain]; s; s = s->texturechain) {
-        if (!bound) // only bind once we are sure we need this texture
-        {
-          entalpha = GL_WaterAlphaForEntitySurface(ent, s);
-          R_BeginTransparentDrawing(entalpha);
-          GL_Bind(t->gltexture);
-          bound = true;
-        }
-        for (p = s->polys->next; p; p = p->next) {
-          DrawWaterPoly(p);
-          rs_brushpasses++;
-        }
-      }
-      R_EndTransparentDrawing(entalpha);
-    }
-  } else if (cl.worldmodel->haslitwater && r_litwater.value &&
-             r_world_program != 0) {
-    const int overbright = !!gl_overbright.value;
-    const int wide10bits = !!r_lightmapwide.value;
+	COMPILE_TIME_ASSERT (vis_alignment_must_be_power_of_2, (VIS_ALIGN & (VIS_ALIGN - 1)) == 0);
+	COMPILE_TIME_ASSERT (vis_alignment_must_be_multiple_of_uint, (VIS_ALIGN & 3) == 0);
+	vissize = (vissize + VIS_ALIGN_MASK) & ~VIS_ALIGN_MASK; // round up
 
-    has_lit_water = true;
+	GL_UseProgram (glprogs.clear_indirect);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 1, gl_bmodel_indirect_buffer, 0, cl.worldmodel->texofs[TEXTYPE_COUNT] * sizeof(bmodel_draw_indirect_t));
+	GL_DispatchComputeFunc ((cl.worldmodel->texofs[TEXTYPE_COUNT] + 63) / 64, 1, 1);
+	GL_MemoryBarrierFunc (GL_SHADER_STORAGE_BARRIER_BIT);
 
-    GL_UseProgramFunc(r_world_program);
+	GL_UseProgram (glprogs.cull_mark);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 2, gl_bmodel_ibo, 0, gl_bmodel_ibo_size);
+	GL_Upload (GL_SHADER_STORAGE_BUFFER, vis, vissize, &buf, &ofs);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 3, buf, (GLintptr)ofs, vissize);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 4, gl_bmodel_leaf_buffer, 0, cl.worldmodel->numleafs * sizeof(bmodel_gpu_leaf_t));
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 5, gl_bmodel_marksurf_buffer, 0, cl.worldmodel->nummarksurfaces * sizeof(cl.worldmodel->marksurfaces[0]));
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 6, gl_bmodel_surf_buffer, 0, cl.worldmodel->numsurfaces * sizeof(bmodel_gpu_surf_t));
+	GL_Upload (GL_UNIFORM_BUFFER, &frame, sizeof(frame), &buf, &ofs);
+	GL_BindBufferRange (GL_UNIFORM_BUFFER, 1, buf, (GLintptr)ofs, sizeof(frame));
 
-    // Bind the buffers
-    GL_BindBuffer(GL_ARRAY_BUFFER, gl_bmodel_vbo);
-    GL_BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+	GL_DispatchComputeFunc ((cl.worldmodel->numleafs + 63) / 64, 1, 1);
+	GL_MemoryBarrierFunc (GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT);
 
-    GL_EnableVertexAttribArrayFunc(vertAttrIndex);
-    GL_EnableVertexAttribArrayFunc(texCoordsAttrIndex);
-    GL_EnableVertexAttribArrayFunc(LMCoordsAttrIndex);
+	GL_EndGroup ();
+}
 
-    GL_VertexAttribPointerFunc(vertAttrIndex, 3, GL_FLOAT, GL_FALSE,
-                               VERTEXSIZE * sizeof(float), ((float *)0));
-    GL_VertexAttribPointerFunc(texCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                               VERTEXSIZE * sizeof(float), ((float *)0) + 3);
-    GL_VertexAttribPointerFunc(LMCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                               VERTEXSIZE * sizeof(float), ((float *)0) + 5);
+/*
+===============
+R_MarkSurfaces
+===============
+*/
+void R_MarkSurfaces (void)
+{
+	byte		*vis;
+	int			i;
+	qboolean	nearwaterportal;
 
-    // Set uniforms
-    GL_Uniform1iFunc(texLoc, 0);
-    GL_Uniform1iFunc(LMTexLoc, 1);
-    GL_Uniform1iFunc(fullbrightTexLoc, 2);
-    GL_Uniform1iFunc(useFullbrightTexLoc, 0);
-    GL_Uniform1iFunc(useOverbrightLoc, overbright);
-    GL_Uniform1iFunc(useAlphaTestLoc, 0);
-    GL_Uniform1iFunc(useLightmapWideLoc, wide10bits);
-    GL_Uniform1iFunc(useLightmapOnlyLoc, 0);
+	// check this leaf for water portals
+	// TODO: loop through all water surfs and use distance to leaf cullbox
+	nearwaterportal = false;
+	for (i=0; i < r_viewleaf->nummarksurfaces; i++)
+		if (cl.worldmodel->surfaces[r_viewleaf->firstmarksurface[i]].flags & SURF_DRAWTURB)
+			nearwaterportal = true;
 
-    for (i = 0; i < model->numtextures; i++) {
-      t = model->textures[i];
+	// choose vis data
+	if (r_novis.value || r_viewleaf->contents == CONTENTS_SOLID || r_viewleaf->contents == CONTENTS_SKY)
+		vis = Mod_NoVisPVS (cl.worldmodel);
+	else if (nearwaterportal)
+		vis = SV_FatPVS (r_origin, cl.worldmodel);
+	else
+		vis = Mod_LeafPVS (r_viewleaf, cl.worldmodel);
 
-      if (!t || !t->texturechains[chain] ||
-          !(t->texturechains[chain]->flags & SURF_DRAWTURB))
-        continue;
+	r_visframecount++;
 
-      if (t->texturechains[chain]->texinfo->flags & TEX_SPECIAL) {
-        has_unlit_water = true;
-        continue;
-      }
-
-      bound = false;
-      entalpha = 1.0f;
-      lastlightmap = 0;
-      for (s = t->texturechains[chain]; s; s = s->texturechain) {
-        if (!bound) // only bind once we are sure we need this texture
-        {
-          entalpha = GL_WaterAlphaForEntitySurface(ent, s);
-          if (entalpha < 1.0f) {
-            GL_Uniform1fFunc(alphaLoc, entalpha);
-            R_BeginTransparentDrawing(entalpha);
-          }
-
-          GL_SelectTexture(GL_TEXTURE0);
-          GL_Bind(t->warpimage);
-
-          if (model != cl.worldmodel) {
-            // ericw -- this is copied from R_DrawSequentialPoly.
-            // If the poly is not part of the world we have to
-            // set this flag
-            t->update_warp = true; // FIXME: one frame too late!
-          }
-
-          bound = true;
-          lastlightmap = s->lightmaptexturenum;
-        }
-
-        if (s->lightmaptexturenum != lastlightmap)
-          R_FlushBatch();
-
-        GL_SelectTexture(GL_TEXTURE1);
-        GL_Bind(lightmaps[s->lightmaptexturenum].texture);
-        lastlightmap = s->lightmaptexturenum;
-        R_BatchSurface(s);
-
-        rs_brushpasses++;
-      }
-      R_FlushBatch();
-      R_EndTransparentDrawing(entalpha);
-    }
-
-    // clean up
-    GL_DisableVertexAttribArrayFunc(vertAttrIndex);
-    GL_DisableVertexAttribArrayFunc(texCoordsAttrIndex);
-    GL_DisableVertexAttribArrayFunc(LMCoordsAttrIndex);
-    GL_UseProgramFunc(0);
-    GL_SelectTexture(GL_TEXTURE0);
-  } else
-    has_unlit_water = true;
-
-  if (has_unlit_water) {
-    // Unlit water
-    for (i = 0; i < model->numtextures; i++) {
-      t = model->textures[i];
-      if (!t || !t->texturechains[chain] ||
-          !(t->texturechains[chain]->flags & SURF_DRAWTURB))
-        continue;
-      if (has_lit_water &&
-          !(t->texturechains[chain]->texinfo->flags & TEX_SPECIAL))
-        continue;
-      bound = false;
-      entalpha = 1.0f;
-      for (s = t->texturechains[chain]; s; s = s->texturechain) {
-        if (!bound) // only bind once we are sure we need this texture
-        {
-          entalpha = GL_WaterAlphaForEntitySurface(ent, s);
-          R_BeginTransparentDrawing(entalpha);
-          GL_Bind(t->warpimage);
-
-          if (model != cl.worldmodel) {
-            // ericw -- this is copied from R_DrawSequentialPoly.
-            // If the poly is not part of the world we have to
-            // set this flag
-            t->update_warp = true; // FIXME: one frame too late!
-          }
-
-          bound = true;
-        }
-        DrawGLPoly(s->polys);
-        rs_brushpasses++;
-      }
-      R_EndTransparentDrawing(entalpha);
-    }
-  }
+	R_MarkVisSurfaces (vis);
+	R_AddStaticModels (vis);
 }
 
 /*
 ================
-R_DrawTextureChains_White -- johnfitz -- draw sky and water as white polys when
-r_lightmap is 1
+GL_WaterAlphaForEntityTextureType
+ 
+Returns the water alpha to use for the entity and texture type combination.
 ================
 */
-void R_DrawTextureChains_White(qmodel_t *model, texchain_t chain) {
-  int i;
-  msurface_t *s;
-  texture_t *t;
-
-  glDisable(GL_TEXTURE_2D);
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        !(t->texturechains[chain]->flags & SURF_DRAWTILED))
-      continue;
-
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      DrawGLPoly(s->polys);
-      rs_brushpasses++;
-    }
-  }
-  glEnable(GL_TEXTURE_2D);
+float GL_WaterAlphaForEntityTextureType (entity_t *ent, textype_t type)
+{
+	float entalpha;
+	if (ent == NULL || ent->alpha == ENTALPHA_DEFAULT)
+		entalpha = GL_WaterAlphaForTextureType(type);
+	else
+		entalpha = ENTALPHA_DECODE(ent->alpha);
+	return entalpha;
 }
 
-/*
-================
-R_DrawLightmapChains -- johnfitz -- R_BlendLightmaps stripped down to almost
-nothing
-================
-*/
-void R_DrawLightmapChains(void) {
-  int i, j;
-  glpoly_t *p;
-  float *v;
+typedef struct bmodel_gpu_instance_s {
+	float		world[12];	// world matrix (transposed mat4x3)
+	float		alpha;
+	float		padding[3];
+} bmodel_gpu_instance_t;
 
-  for (i = 0; i < lightmap_count; i++) {
-    if (!lightmaps[i].polys)
-      continue;
+typedef struct bmodel_bindless_gpu_call_s {
+	GLuint		flags;
+	GLfloat		alpha;
+	GLuint64	texture;
+	GLuint64	fullbright;
+} bmodel_bindless_gpu_call_t;
 
-    GL_Bind(lightmaps[i].texture);
-    for (p = lightmaps[i].polys; p; p = p->chain) {
-      glBegin(GL_POLYGON);
-      v = p->verts[0];
-      for (j = 0; j < p->numverts; j++, v += VERTEXSIZE) {
-        glTexCoord2f(v[5], v[6]);
-        glVertex3fv(v);
-      }
-      glEnd();
-      rs_brushpasses++;
-    }
-  }
-}
+typedef struct bmodel_bound_gpu_call_s {
+	GLuint		flags;
+	GLfloat		alpha;
+	GLint		baseinstance;
+	GLint		padding;
+} bmodel_bound_gpu_call_t;
+
+typedef struct bmodel_gpu_call_remap_s {
+	GLuint		src;
+	GLuint		inst;
+} bmodel_gpu_call_remap_t;
+
+static bmodel_gpu_instance_t		bmodel_instances[MAX_VISEDICTS + 1]; // +1 for worldspawn
+static union {
+	struct {
+		bmodel_bindless_gpu_call_t	params[MAX_BMODEL_DRAWS];
+	} bindless;
+	struct {
+		bmodel_bound_gpu_call_t		params[MAX_BMODEL_DRAWS];
+		gltexture_t					*textures[MAX_BMODEL_DRAWS][2];
+	} bound;
+} bmodel_calls;
+static bmodel_gpu_call_remap_t		bmodel_call_remap[MAX_BMODEL_DRAWS];
+static int							num_bmodel_calls;
+static GLuint						bmodel_batch_program;
 
 /*
 =============
-GLWorld_CreateShaders
+R_InitBModelInstance
 =============
 */
-void GLWorld_CreateShaders(void) {
-  const glsl_attrib_binding_t bindings[] = {{"Vert", vertAttrIndex},
-                                            {"TexCoords", texCoordsAttrIndex},
-                                            {"LMCoords", LMCoordsAttrIndex}};
+static void R_InitBModelInstance (bmodel_gpu_instance_t *inst, entity_t *ent)
+{
+	vec3_t angles;
+	float mat[16];
 
-  // Driver bug workarounds:
-  // - "Intel(R) UHD Graphics 600" version "4.6.0 - Build 26.20.100.7263"
-  //    crashing on glUseProgram with `vec3 Vert` and
-  //    `gl_ModelViewProjectionMatrix * vec4(Vert, 1.0);`. Work around with
-  //    making Vert a vec4. (https://sourceforge.net/p/quakespasm/bugs/39/)
-  const GLchar *vertSource =
-      "#version 110\n"
-      "\n"
-      "attribute vec4 Vert;\n"
-      "attribute vec2 TexCoords;\n"
-      "attribute vec2 LMCoords;\n"
-      "\n"
-      "varying float FogFragCoord;\n"
-      "\n"
-      "void main()\n"
-      "{\n"
-      "	gl_TexCoord[0] = vec4(TexCoords, 0.0, 0.0);\n"
-      "	gl_TexCoord[1] = vec4(LMCoords, 0.0, 0.0);\n"
-      "	gl_Position = gl_ModelViewProjectionMatrix * Vert;\n"
-      "	FogFragCoord = gl_Position.w;\n"
-      "}\n";
+	angles[0] = -ent->angles[0];
+	angles[1] =  ent->angles[1];
+	angles[2] =  ent->angles[2];
+	R_EntityMatrix (mat, ent->origin, angles, ent == &cl_entities[0] ? ENTSCALE_DEFAULT : ent->scale);
 
-  const GLchar *fragSource =
-      "#version 110\n"
-      "\n"
-      "uniform sampler2D Tex;\n"
-      "uniform sampler2D LMTex;\n"
-      "uniform sampler2D FullbrightTex;\n"
-      "uniform bool UseFullbrightTex;\n"
-      "uniform bool UseOverbright;\n"
-      "uniform bool UseAlphaTest;\n"
-      "uniform bool UseLightmapWide;\n"
-      "uniform bool UseLightmapOnly;\n"
-      "uniform float Alpha;\n"
-      "\n"
-      "varying float FogFragCoord;\n"
-      "\n"
-      "void main()\n"
-      "{\n"
-      "	vec4 result = texture2D(Tex, gl_TexCoord[0].xy);\n"
-      "	if (UseLightmapOnly)\n"
-      "		result = vec4(0.5, 0.5, 0.5, 1.0);\n"
-      "	if (UseAlphaTest && (result.a < 0.666))\n"
-      "		discard;\n"
-      "	result *= texture2D(LMTex, gl_TexCoord[1].xy);\n"
-      "	if (UseLightmapWide)\n"
-      "	    result.rgb *= 4.0;\n"
-      "	if (UseOverbright)\n"
-      "		result.rgb *= 2.0;\n"
-      "	if (UseFullbrightTex)\n"
-      "		result += texture2D(FullbrightTex, gl_TexCoord[0].xy);\n"
-      "	result = clamp(result, 0.0, 1.0);\n"
-      "	float fog = exp(-gl_Fog.density * gl_Fog.density * FogFragCoord * "
-      "FogFragCoord);\n"
-      "	fog = clamp(fog, 0.0, 1.0);\n"
-      "	result = mix(gl_Fog.color, result, fog);\n"
-      "	result.a = Alpha;\n" // FIXME: This will make almost transparent things
-                             // cut holes though heavy fog
-      "	gl_FragColor = result;\n"
-      "}\n";
+	MatrixTranspose4x3 (mat, inst->world);
 
-  if (!gl_glsl_alias_able)
-    return;
-
-  r_world_program =
-      GL_CreateProgram(vertSource, fragSource, Q_COUNTOF(bindings), bindings);
-
-  if (r_world_program != 0) {
-    // get uniform locations
-    texLoc = GL_GetUniformLocation(&r_world_program, "Tex");
-    LMTexLoc = GL_GetUniformLocation(&r_world_program, "LMTex");
-    fullbrightTexLoc = GL_GetUniformLocation(&r_world_program, "FullbrightTex");
-    useFullbrightTexLoc =
-        GL_GetUniformLocation(&r_world_program, "UseFullbrightTex");
-    useOverbrightLoc = GL_GetUniformLocation(&r_world_program, "UseOverbright");
-    useAlphaTestLoc = GL_GetUniformLocation(&r_world_program, "UseAlphaTest");
-    useLightmapWideLoc =
-        GL_GetUniformLocation(&r_world_program, "UseLightmapWide");
-    useLightmapOnlyLoc =
-        GL_GetUniformLocation(&r_world_program, "UseLightmapOnly");
-    alphaLoc = GL_GetUniformLocation(&r_world_program, "Alpha");
-  }
-}
-
-/*
-================
-R_DrawTextureChains_GLSL -- ericw
-
-Draw lightmapped surfaces with fulbrights in one pass, using VBO.
-Requires 3 TMUs, OpenGL 2.0
-================
-*/
-void R_DrawTextureChains_GLSL(qmodel_t *model, entity_t *ent,
-                              texchain_t chain) {
-  const float entalpha = (ent != NULL) ? ENTALPHA_DECODE(ent->alpha) : 1.0f;
-  const int overbright = !!gl_overbright.value;
-  const int wide10bits = !!r_lightmapwide.value;
-
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  qboolean bound;
-  int lastlightmap;
-  gltexture_t *fullbright = NULL;
-
-  // enable blending / disable depth writes
-  if (entalpha < 1) {
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-  }
-
-  GL_UseProgramFunc(r_world_program);
-
-  // Bind the buffers
-  GL_BindBuffer(GL_ARRAY_BUFFER, gl_bmodel_vbo);
-  GL_BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // indices come from client memory!
-
-  GL_EnableVertexAttribArrayFunc(vertAttrIndex);
-  GL_EnableVertexAttribArrayFunc(texCoordsAttrIndex);
-  GL_EnableVertexAttribArrayFunc(LMCoordsAttrIndex);
-
-  GL_VertexAttribPointerFunc(vertAttrIndex, 3, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0));
-  GL_VertexAttribPointerFunc(texCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0) + 3);
-  GL_VertexAttribPointerFunc(LMCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0) + 5);
-
-  // set uniforms
-  GL_Uniform1iFunc(texLoc, 0);
-  GL_Uniform1iFunc(LMTexLoc, 1);
-  GL_Uniform1iFunc(fullbrightTexLoc, 2);
-  GL_Uniform1iFunc(useFullbrightTexLoc, 0);
-  GL_Uniform1iFunc(useOverbrightLoc, overbright);
-  GL_Uniform1iFunc(useAlphaTestLoc, 0);
-  GL_Uniform1iFunc(useLightmapWideLoc, wide10bits);
-  GL_Uniform1iFunc(useLightmapOnlyLoc, 0);
-  GL_Uniform1fFunc(alphaLoc, entalpha);
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        t->texturechains[chain]->flags &
-            (SURF_DRAWTURB | SURF_DRAWTILED | SURF_NOTEXTURE))
-      continue;
-
-    // Enable/disable TMU 2 (fullbrights)
-    // FIXME: Move below to where we bind GL_TEXTURE0
-    if (gl_fullbrights.value &&
-        (fullbright =
-             R_TextureAnimation(t, ent != NULL ? ent->frame : 0)->fullbright)) {
-      GL_SelectTexture(GL_TEXTURE2);
-      GL_Bind(fullbright);
-      GL_Uniform1iFunc(useFullbrightTexLoc, 1);
-    } else
-      GL_Uniform1iFunc(useFullbrightTexLoc, 0);
-
-    R_ClearBatch();
-
-    bound = false;
-    lastlightmap = 0; // avoid compiler warning
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (!bound) // only bind once we are sure we need this texture
-      {
-        GL_SelectTexture(GL_TEXTURE0);
-        GL_Bind(
-            (R_TextureAnimation(t, ent != NULL ? ent->frame : 0))->gltexture);
-        if (t->texturechains[chain]->flags & SURF_DRAWFENCE)
-          GL_Uniform1iFunc(useAlphaTestLoc, 1); // Flip alpha test back on
-
-        bound = true;
-        lastlightmap = s->lightmaptexturenum;
-      }
-
-      if (s->lightmaptexturenum != lastlightmap)
-        R_FlushBatch();
-
-      GL_SelectTexture(GL_TEXTURE1);
-      GL_Bind(lightmaps[s->lightmaptexturenum].texture);
-      lastlightmap = s->lightmaptexturenum;
-      R_BatchSurface(s);
-
-      rs_brushpasses++;
-    }
-
-    R_FlushBatch();
-
-    if (bound && t->texturechains[chain]->flags & SURF_DRAWFENCE)
-      GL_Uniform1iFunc(useAlphaTestLoc, 0); // Flip alpha test back off
-  }
-
-  // clean up
-  GL_DisableVertexAttribArrayFunc(vertAttrIndex);
-  GL_DisableVertexAttribArrayFunc(texCoordsAttrIndex);
-  GL_DisableVertexAttribArrayFunc(LMCoordsAttrIndex);
-
-  GL_UseProgramFunc(0);
-  GL_SelectTexture(GL_TEXTURE0);
-
-  if (entalpha < 1) {
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
-  }
-}
-
-/*
-================
-R_DrawLightmapChains_GLSL -- ericw
-================
-*/
-void R_DrawLightmapChains_GLSL(qmodel_t *model, entity_t *ent,
-                               texchain_t chain) {
-  const int overbright = !!gl_overbright.value;
-  const int wide10bits = !!r_lightmapwide.value;
-
-  int i;
-  msurface_t *s;
-  texture_t *t;
-  int lastlightmap;
-
-  GL_UseProgramFunc(r_world_program);
-
-  // Bind the buffers
-  GL_BindBuffer(GL_ARRAY_BUFFER, gl_bmodel_vbo);
-  GL_BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // indices come from client memory!
-
-  GL_EnableVertexAttribArrayFunc(vertAttrIndex);
-  GL_EnableVertexAttribArrayFunc(texCoordsAttrIndex);
-  GL_EnableVertexAttribArrayFunc(LMCoordsAttrIndex);
-
-  GL_VertexAttribPointerFunc(vertAttrIndex, 3, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0));
-  GL_VertexAttribPointerFunc(texCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0) + 3);
-  GL_VertexAttribPointerFunc(LMCoordsAttrIndex, 2, GL_FLOAT, GL_FALSE,
-                             VERTEXSIZE * sizeof(float), ((float *)0) + 5);
-
-  // set uniforms
-  GL_Uniform1iFunc(texLoc, 0);
-  GL_Uniform1iFunc(LMTexLoc, 1);
-  GL_Uniform1iFunc(fullbrightTexLoc, 2);
-  GL_Uniform1iFunc(useFullbrightTexLoc, 0);
-  GL_Uniform1iFunc(useOverbrightLoc, overbright);
-  GL_Uniform1iFunc(useAlphaTestLoc, 0);
-  GL_Uniform1iFunc(useLightmapWideLoc, wide10bits);
-  GL_Uniform1fFunc(alphaLoc, 1.0f);
-  GL_Uniform1iFunc(useFullbrightTexLoc, 0);
-  GL_Uniform1iFunc(useLightmapOnlyLoc, 1);
-
-  R_ClearBatch();
-  lastlightmap = -1;
-
-  for (i = 0; i < model->numtextures; i++) {
-    t = model->textures[i];
-
-    if (!t || !t->texturechains[chain] ||
-        t->texturechains[chain]->flags & (SURF_DRAWTILED | SURF_NOTEXTURE))
-      continue;
-
-    if (t->texturechains[chain]->texinfo->flags & TEX_SPECIAL)
-      continue; // unlit water
-
-    for (s = t->texturechains[chain]; s; s = s->texturechain) {
-      if (s->lightmaptexturenum < 0)
-        continue;
-
-      if (s->lightmaptexturenum != lastlightmap) {
-        R_FlushBatch();
-
-        GL_SelectTexture(GL_TEXTURE1);
-        GL_Bind(lightmaps[s->lightmaptexturenum].texture);
-        lastlightmap = s->lightmaptexturenum;
-      }
-      R_BatchSurface(s);
-
-      rs_brushpasses++;
-    }
-  }
-
-  R_FlushBatch();
-
-  // clean up
-  GL_DisableVertexAttribArrayFunc(vertAttrIndex);
-  GL_DisableVertexAttribArrayFunc(texCoordsAttrIndex);
-  GL_DisableVertexAttribArrayFunc(LMCoordsAttrIndex);
-
-  GL_UseProgramFunc(0);
-  GL_SelectTexture(GL_TEXTURE0);
+	inst->alpha = ent->alpha == ENTALPHA_DEFAULT ? -1.f : ENTALPHA_DECODE (ent->alpha);
+	memset (&inst->padding, 0, sizeof(inst->padding));
 }
 
 /*
 =============
-R_DrawWorld -- johnfitz -- rewritten
+R_ResetBModelCalls
 =============
 */
-void R_DrawTextureChains(qmodel_t *model, entity_t *ent, texchain_t chain) {
-  float entalpha;
-
-  if (ent != NULL)
-    entalpha = ENTALPHA_DECODE(ent->alpha);
-  else
-    entalpha = 1;
-
-  R_UploadLightmaps();
-
-  if (r_drawflat_cheatsafe) {
-    glDisable(GL_TEXTURE_2D);
-    R_DrawTextureChains_Drawflat(model, chain);
-    glEnable(GL_TEXTURE_2D);
-    return;
-  }
-
-  if (r_fullbright_cheatsafe) {
-    R_BeginTransparentDrawing(entalpha);
-    R_DrawTextureChains_TextureOnly(model, ent, chain);
-    R_EndTransparentDrawing(entalpha);
-    goto fullbrights;
-  }
-
-  if (r_lightmap_cheatsafe) {
-    if (r_world_program != 0) {
-      R_DrawLightmapChains_GLSL(model, ent, chain);
-      return;
-    }
-
-    if (!gl_overbright.value) {
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-      glColor3f(0.5, 0.5, 0.5);
-    }
-    R_DrawLightmapChains();
-    if (!gl_overbright.value) {
-      glColor3f(1, 1, 1);
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    }
-    R_DrawTextureChains_White(model, chain);
-    return;
-  }
-
-  R_BeginTransparentDrawing(entalpha);
-
-  R_DrawTextureChains_NoTexture(model, chain);
-
-  // OpenGL 2 fast path
-  if (r_world_program != 0) {
-    R_EndTransparentDrawing(entalpha);
-
-    R_DrawTextureChains_GLSL(model, ent, chain);
-    return;
-  }
-
-  if (gl_overbright.value) {
-    if (gl_texture_env_combine &&
-        gl_mtexable) // case 1: texture and lightmap in one pass, overbright
-                     // using texture combiners
-    {
-      GL_EnableMultitexture();
-      glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE_EXT);
-      glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB_EXT, GL_MODULATE);
-      glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB_EXT, GL_PREVIOUS_EXT);
-      glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB_EXT, GL_TEXTURE);
-      glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE_EXT, 2.0f);
-      GL_DisableMultitexture();
-      R_DrawTextureChains_Multitexture(model, ent, chain);
-      GL_EnableMultitexture();
-      glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE_EXT, 1.0f);
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-      GL_DisableMultitexture();
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    } else if (entalpha < 1) // case 2: can't do multipass if entity has alpha,
-                             // so just draw the texture
-    {
-      R_DrawTextureChains_TextureOnly(model, ent, chain);
-    } else // case 3: texture in one pass, lightmap in second pass using 2x
-           // modulation blend func, fog in third pass
-    {
-      // to make fog work with multipass lightmapping, need to do one pass
-      // with no fog, one modulate pass with black fog, and one additive
-      // pass with black geometry and normal fog
-      Fog_DisableGFog();
-      R_DrawTextureChains_TextureOnly(model, ent, chain);
-      Fog_EnableGFog();
-      glDepthMask(GL_FALSE);
-      glEnable(GL_BLEND);
-      glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR); // 2x modulate
-      Fog_StartAdditive();
-      R_DrawLightmapChains();
-      Fog_StopAdditive();
-      if (Fog_GetDensity() > 0) {
-        glBlendFunc(GL_ONE, GL_ONE); // add
-        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-        glColor3f(0, 0, 0);
-        R_DrawTextureChains_TextureOnly(model, ent, chain);
-        glColor3f(1, 1, 1);
-        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-      }
-      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-      glDisable(GL_BLEND);
-      glDepthMask(GL_TRUE);
-    }
-  } else {
-    if (gl_mtexable) // case 4: texture and lightmap in one pass, regular
-                     // modulation
-    {
-      GL_EnableMultitexture();
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-      GL_DisableMultitexture();
-      R_DrawTextureChains_Multitexture(model, ent, chain);
-      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    } else if (entalpha < 1) // case 5: can't do multipass if entity has alpha,
-                             // so just draw the texture
-    {
-      R_DrawTextureChains_TextureOnly(model, ent, chain);
-    } else // case 6: texture in one pass, lightmap in a second pass, fog in
-           // third pass
-    {
-      // to make fog work with multipass lightmapping, need to do one pass
-      // with no fog, one modulate pass with black fog, and one additive
-      // pass with black geometry and normal fog
-      Fog_DisableGFog();
-      R_DrawTextureChains_TextureOnly(model, ent, chain);
-      Fog_EnableGFog();
-      glDepthMask(GL_FALSE);
-      glEnable(GL_BLEND);
-      glBlendFunc(GL_ZERO, GL_SRC_COLOR); // modulate
-      Fog_StartAdditive();
-      R_DrawLightmapChains();
-      Fog_StopAdditive();
-      if (Fog_GetDensity() > 0) {
-        glBlendFunc(GL_ONE, GL_ONE); // add
-        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-        glColor3f(0, 0, 0);
-        R_DrawTextureChains_TextureOnly(model, ent, chain);
-        glColor3f(1, 1, 1);
-        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-      }
-      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-      glDisable(GL_BLEND);
-      glDepthMask(GL_TRUE);
-    }
-  }
-
-  R_EndTransparentDrawing(entalpha);
-
-fullbrights:
-  if (gl_fullbrights.value) {
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_ONE, GL_ONE);
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glColor3f(entalpha, entalpha, entalpha);
-    Fog_StartAdditive();
-    R_DrawTextureChains_Glow(model, ent, chain);
-    Fog_StopAdditive();
-    glColor3f(1, 1, 1);
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_BLEND);
-    glDepthMask(GL_TRUE);
-  }
+static void R_ResetBModelCalls (GLuint program)
+{
+	bmodel_batch_program = program;
+	num_bmodel_calls = 0;
 }
 
 /*
 =============
-R_DrawWorld -- ericw -- moved from R_DrawTextureChains, which is no longer
-specific to the world.
+R_FlushBModelCalls
 =============
 */
-void R_DrawWorld(void) {
-  if (!r_drawworld_cheatsafe)
-    return;
+static void R_FlushBModelCalls (void)
+{
+	GLuint	cmdbuf, buf;
+	GLbyte	*ofs;
+	size_t	dstcmdofs;
 
-  R_DrawTextureChains(cl.worldmodel, NULL, chain_world);
+	if (!num_bmodel_calls)
+		return;
+
+	GL_ReserveDeviceMemory (GL_DRAW_INDIRECT_BUFFER, sizeof (bmodel_draw_indirect_t) * num_bmodel_calls, &cmdbuf, &dstcmdofs);
+
+	GL_UseProgram (glprogs.gather_indirect);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 5, gl_bmodel_indirect_buffer, 0, gl_bmodel_indirect_buffer_size);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 6, cmdbuf, dstcmdofs, sizeof (bmodel_draw_indirect_t) * num_bmodel_calls);
+	GL_Upload (GL_SHADER_STORAGE_BUFFER, bmodel_call_remap, sizeof (bmodel_call_remap[0]) * num_bmodel_calls, &buf, &ofs);
+	GL_BindBufferRange  (GL_SHADER_STORAGE_BUFFER, 7, buf, (GLintptr)ofs, sizeof (bmodel_call_remap[0]) * num_bmodel_calls);
+	GL_DispatchComputeFunc ((num_bmodel_calls + 63) / 64, 1, 1);
+	GL_MemoryBarrierFunc (GL_COMMAND_BARRIER_BIT);
+
+	GL_UseProgram (bmodel_batch_program);
+	GL_BindBuffer (GL_ELEMENT_ARRAY_BUFFER, gl_bmodel_ibo);
+	GL_BindBuffer (GL_ARRAY_BUFFER, gl_bmodel_vbo);
+	GL_BindBuffer (GL_DRAW_INDIRECT_BUFFER, cmdbuf);
+	GL_VertexAttribPointerFunc (0, 3, GL_FLOAT, GL_FALSE, sizeof (glvert_t), (void *) offsetof (glvert_t, pos));
+	GL_VertexAttribPointerFunc (1, 4, GL_FLOAT, GL_FALSE, sizeof (glvert_t), (void *) offsetof (glvert_t, st));
+	GL_VertexAttribPointerFunc (2, 1, GL_FLOAT, GL_FALSE, sizeof (glvert_t), (void *) offsetof (glvert_t, lmofs));
+	GL_VertexAttribIPointerFunc (3, 4, GL_UNSIGNED_BYTE, sizeof (glvert_t), (void *) offsetof (glvert_t, styles));
+
+	if (gl_bindless_able)
+	{
+		GL_Upload (GL_SHADER_STORAGE_BUFFER, bmodel_calls.bindless.params, sizeof (bmodel_calls.bindless.params[0]) * num_bmodel_calls, &buf, &ofs);
+		GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 1, buf, (GLintptr)ofs, sizeof (bmodel_calls.bindless.params[0]) * num_bmodel_calls);
+		GL_MultiDrawElementsIndirectFunc (GL_TRIANGLES, GL_UNSIGNED_INT, (const void *)dstcmdofs, num_bmodel_calls, sizeof (bmodel_draw_indirect_t));
+	}
+	else
+	{
+		int i;
+
+		GL_Upload (GL_SHADER_STORAGE_BUFFER, &bmodel_calls.bound.params, sizeof (bmodel_calls.bound.params[0]) * num_bmodel_calls, &buf, &ofs);
+		GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 1, buf, (GLintptr)ofs, sizeof (bmodel_calls.bound.params[0]) * num_bmodel_calls);
+
+		for (i = 0; i < num_bmodel_calls; i++)
+		{
+			GL_Uniform1iFunc (0, i);
+			GL_BindTextures (0, 2, bmodel_calls.bound.textures[i]);
+			GL_DrawElementsIndirectFunc (GL_TRIANGLES, GL_UNSIGNED_INT, (const byte *)(dstcmdofs + i * sizeof (bmodel_draw_indirect_t)));
+		}
+	}
+
+	num_bmodel_calls = 0;
 }
 
 /*
 =============
-R_DrawWorld_Water -- ericw -- moved from R_DrawTextureChains_Water, which is no
-longer specific to the world.
+R_AddBModelCall
 =============
 */
-void R_DrawWorld_Water(void) {
-  if (!r_drawworld_cheatsafe)
-    return;
+static void R_AddBModelCall (int index, int first_instance, int num_instances, texture_t *t, qboolean zfix)
+{
+	GLuint		flags;
+	float		alpha;
+	gltexture_t	*tx, *fb;
 
-  R_DrawTextureChains_Water(cl.worldmodel, NULL, chain_world);
+	if (num_bmodel_calls == MAX_BMODEL_DRAWS)
+		R_FlushBModelCalls ();
+
+	if (t)
+	{
+		tx = t->gltexture;
+		fb = t->fullbright;
+		if (r_lightmap_cheatsafe)
+			tx = fb = NULL;
+		if (!gl_fullbrights.value && t->type != TEXTYPE_SKY)
+			fb = NULL;
+	}
+	else
+	{
+		tx = fb = whitetexture;
+	}
+
+	if (!gl_zfix.value)
+		zfix = 0;
+
+	flags = zfix | ((fb != NULL) << 1) | ((r_fullbright_cheatsafe != false) << 2);
+	alpha = t ? GL_WaterAlphaForTextureType (t->type) : 1.f;
+
+	if (gl_bindless_able)
+	{
+		bmodel_bindless_gpu_call_t *call = &bmodel_calls.bindless.params[num_bmodel_calls];
+		call->flags = flags;
+		call->alpha = alpha;
+		call->texture = tx ? tx->bindless_handle : greytexture->bindless_handle;
+		call->fullbright = fb ? fb->bindless_handle : blacktexture->bindless_handle;
+	}
+	else
+	{
+		bmodel_bound_gpu_call_t *call = &bmodel_calls.bound.params[num_bmodel_calls];
+		gltexture_t **textures = bmodel_calls.bound.textures[num_bmodel_calls];
+		call->flags = flags;
+		call->alpha = alpha;
+		call->baseinstance = first_instance;
+		call->padding = 0;
+		textures[0] = tx ? tx : greytexture;
+		textures[1] = fb ? fb : blacktexture;
+	}
+
+	SDL_assert (num_instances > 0);
+	SDL_assert (num_instances <= MAX_BMODEL_INSTANCES);
+	bmodel_call_remap[num_bmodel_calls].src = index;
+	bmodel_call_remap[num_bmodel_calls].inst = first_instance * MAX_BMODEL_INSTANCES + (num_instances - 1);
+
+	++num_bmodel_calls;
 }
 
 /*
 =============
-R_DrawWorld_ShowTris -- ericw -- moved from R_DrawTextureChains_ShowTris, which
-is no longer specific to the world.
+R_ChooseBModelProgram
 =============
 */
-void R_DrawWorld_ShowTris(void) {
-  if (!r_drawworld_cheatsafe)
-    return;
+static GLuint R_ChooseBModelProgram (qboolean oit, qboolean alphatest)
+{
+	extern cvar_t r_softemu_lightmap_banding;
 
-  R_DrawTextureChains_ShowTris(cl.worldmodel, chain_world);
+	switch (softemu)
+	{
+	case SOFTEMU_BANDED:
+		if (r_softemu_lightmap_banding.value != 0.f)
+			return glprogs.world[oit][2][alphatest];
+		else
+			return glprogs.world[oit][1][alphatest];
+
+	case SOFTEMU_COARSE:
+		if (r_softemu_lightmap_banding.value > 0.f)
+			return glprogs.world[oit][2][alphatest];
+		else
+			return glprogs.world[oit][1][alphatest];
+
+	default:
+		if (r_softemu_lightmap_banding.value > 0.f)
+			return glprogs.world[oit][2][alphatest];
+		else
+			return glprogs.world[oit][0][alphatest];
+	}
+}
+
+typedef enum {
+	BP_SOLID,
+	BP_ALPHATEST,
+	BP_SKYLAYERS,
+	BP_SKYCUBEMAP,
+	BP_SKYSTENCIL,
+	BP_SHOWTRIS,
+} brushpass_t;
+
+/*
+=============
+R_DrawBrushModels_Real
+=============
+*/
+static void R_DrawBrushModels_Real (entity_t **ents, int count, brushpass_t pass, qboolean translucent)
+{
+	int i, j;
+	int totalinst, baseinst;
+	unsigned state;
+	GLuint program;
+	GLuint buf;
+	GLbyte *ofs;
+	textype_t texbegin, texend;
+	qboolean oit;
+
+	if (!count)
+		return;
+
+	if (count > countof(bmodel_instances))
+	{
+		Con_DWarning ("bmodel instance overflow: %d > %d\n", count, (int)countof(bmodel_instances));
+		count = countof(bmodel_instances);
+	}
+
+	oit = translucent && r_oit.value != 0.f;
+	switch (pass)
+	{
+	default:
+	case BP_SOLID:
+		texbegin = 0;
+		texend = TEXTYPE_CUTOUT;
+		program = R_ChooseBModelProgram (oit, false);
+		break;
+	case BP_ALPHATEST:
+		texbegin = TEXTYPE_CUTOUT;
+		texend = TEXTYPE_CUTOUT + 1;
+		program = R_ChooseBModelProgram (oit, true);
+		break;
+	case BP_SKYLAYERS:
+		texbegin = TEXTYPE_SKY;
+		texend = TEXTYPE_SKY + 1;
+		program = glprogs.skylayers[softemu == SOFTEMU_COARSE];
+		break;
+	case BP_SKYCUBEMAP:
+		texbegin = TEXTYPE_SKY;
+		texend = TEXTYPE_SKY + 1;
+		program = glprogs.skycubemap[Sky_IsAnimated ()][softemu == SOFTEMU_COARSE];
+		break;
+	case BP_SKYSTENCIL:
+		texbegin = TEXTYPE_SKY;
+		texend = TEXTYPE_SKY + 1;
+		program = glprogs.skystencil;
+		break;
+	case BP_SHOWTRIS:
+		texbegin = 0;
+		texend = TEXTYPE_COUNT;
+		program = glprogs.world[0][0][0];
+		break;
+	}
+
+	// fill instance data
+	for (i = 0, totalinst = 0; i < count; i++)
+		if (ents[i]->model->texofs[texend] - ents[i]->model->texofs[texbegin] > 0)
+			R_InitBModelInstance (&bmodel_instances[totalinst++], ents[i]);
+
+	if (!totalinst)
+		return;
+
+	// setup state
+	state = GLS_CULL_BACK | GLS_ATTRIBS(4);
+	if (!translucent)
+		state |= GLS_BLEND_OPAQUE;
+	else
+		state |= GLS_BLEND_ALPHA_OIT | GLS_NO_ZWRITE;
+	
+	R_ResetBModelCalls (program);
+	GL_SetState (state);
+	if (pass <= BP_ALPHATEST)
+		GL_Bind (GL_TEXTURE2, r_fullbright_cheatsafe ? greytexture : lightmap_texture);
+	else if (pass == BP_SKYCUBEMAP)
+		GL_Bind (GL_TEXTURE2, skybox->cubemap);
+
+	GL_Upload (GL_SHADER_STORAGE_BUFFER, bmodel_instances, sizeof(bmodel_instances[0]) * count, &buf, &ofs);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 2, buf, (GLintptr)ofs, sizeof(bmodel_instances[0]) * count);
+
+	// generate drawcalls
+	for (i = 0, baseinst = 0; i < count; /**/)
+	{
+		int numinst;
+		entity_t *e = ents[i++];
+		qmodel_t *model = e->model;
+		qboolean isworld = (e == &cl_entities[0]);
+		int frame = isworld ? 0 : e->frame;
+		int numtex = model->texofs[texend] - model->texofs[texbegin];
+
+		if (!numtex)
+			continue;
+
+		for (numinst = 1; i < count && ents[i]->model == model && numinst < MAX_BMODEL_INSTANCES; i++)
+			numinst += (ents[i]->model->texofs[texend] - ents[i]->model->texofs[texbegin]) > 0;
+
+		for (j = model->texofs[texbegin]; j < model->texofs[texend]; j++)
+		{
+			texture_t *t = model->textures[model->usedtextures[j]];
+			R_AddBModelCall (model->firstcmd + j, baseinst, numinst, pass != BP_SHOWTRIS ? R_TextureAnimation (t, frame) : 0, !isworld);
+		}
+
+		baseinst += numinst;
+	}
+
+	R_FlushBModelCalls ();
+}
+
+/*
+=============
+R_EntHasWater
+=============
+*/
+static qboolean R_EntHasWater (entity_t *ent, qboolean translucent)
+{
+	int i;
+	for (i = TEXTYPE_FIRSTLIQUID; i < TEXTYPE_LASTLIQUID+1; i++)
+	{
+		int numtex = ent->model->texofs[i+1] - ent->model->texofs[i];
+		if (numtex && (GL_WaterAlphaForEntityTextureType (ent, (textype_t)i) < 1.f) == translucent)
+			return true;
+	}
+	return false;
+}
+
+/*
+=============
+R_DrawBrushModels_Water
+=============
+*/
+void R_DrawBrushModels_Water (entity_t **ents, int count, qboolean translucent)
+{
+	int i, j;
+	int totalinst, baseinst;
+	unsigned state;
+	GLuint buf, program;
+	GLbyte *ofs;
+	qboolean oit;
+
+	if (count > countof(bmodel_instances))
+	{
+		Con_DWarning ("bmodel instance overflow: %d > %d\n", count, (int)countof(bmodel_instances));
+		count = countof(bmodel_instances);
+	}
+
+	// fill instance data
+	for (i = 0, totalinst = 0; i < count; i++)
+		if (R_EntHasWater (ents[i], translucent))
+			R_InitBModelInstance (&bmodel_instances[totalinst++], ents[i]);
+
+	if (!totalinst)
+		return;
+
+	GL_BeginGroup (translucent ? "Water (translucent)" : "Water (opaque)");
+
+	// setup state
+	state = GLS_CULL_BACK | GLS_ATTRIBS(4);
+	if (translucent)
+		state |= GLS_BLEND_ALPHA_OIT | GLS_NO_ZWRITE;
+	else
+		state |= GLS_BLEND_OPAQUE;
+
+	oit = translucent && r_oit.value != 0.f;
+	if (cl.worldmodel->haslitwater && r_litwater.value)
+		program = glprogs.world[oit][q_max(0, (int)softemu - 1)][WORLDSHADER_WATER];
+	else
+		program = glprogs.water[oit][softemu == SOFTEMU_COARSE];
+
+	R_ResetBModelCalls (program);
+	GL_SetState (state);
+	GL_Bind (GL_TEXTURE2, r_fullbright_cheatsafe ? greytexture : lightmap_texture);
+
+	GL_Upload (GL_SHADER_STORAGE_BUFFER, bmodel_instances, sizeof(bmodel_instances[0]) * totalinst, &buf, &ofs);
+	GL_BindBufferRange (GL_SHADER_STORAGE_BUFFER, 2, buf, (GLintptr)ofs, sizeof(bmodel_instances[0]) * count);
+
+	// generate drawcalls
+	for (i = 0, baseinst = 0; i < count; /**/)
+	{
+		int numinst;
+		entity_t *e = ents[i++];
+		qmodel_t *model = e->model;
+		qboolean isworld = (e == &cl_entities[0]);
+		int frame = isworld ? 0 : e->frame;
+
+		if (!R_EntHasWater (e, translucent))
+			continue;
+
+		for (numinst = 1; i < count && ents[i]->model == model && numinst < MAX_BMODEL_INSTANCES; i++)
+			numinst += R_EntHasWater (ents[i], translucent);
+
+		for (j = model->texofs[TEXTYPE_FIRSTLIQUID]; j < model->texofs[TEXTYPE_LASTLIQUID+1]; j++)
+		{
+			texture_t *t = model->textures[model->usedtextures[j]];
+			if ((GL_WaterAlphaForEntityTextureType (e, t->type) < 1.f) != translucent)
+				continue;
+			R_AddBModelCall (model->firstcmd + j, baseinst, numinst, R_TextureAnimation (t, frame), !isworld);
+		}
+
+		baseinst += numinst;
+	}
+
+	R_FlushBModelCalls ();
+
+	GL_EndGroup ();
+}
+
+/*
+=============
+R_GetBModelAlphaPasses
+=============
+*/
+static uint32_t R_GetBModelAlphaPasses (const entity_t *ent)
+{
+	const qmodel_t *mod = ent->model;
+	uint32_t mask = 0;
+
+	if (mod->texofs[TEXTYPE_CUTOUT] != mod->texofs[TEXTYPE_DEFAULT])
+		mask |= (1 << BP_SOLID);
+	if (mod->texofs[TEXTYPE_SKY] != mod->texofs[TEXTYPE_CUTOUT])
+		mask |= (1 << BP_ALPHATEST);
+
+	return mask;
+}
+
+/*
+=============
+R_CanMergeBModelAlphaPasses
+=============
+*/
+static qboolean R_CanMergeBModelAlphaPasses (uint32_t mask_a, uint32_t mask_b)
+{
+	COMPILE_TIME_ASSERT (check_bit_0, BP_SOLID == 0);
+	COMPILE_TIME_ASSERT (check_bit_1, BP_ALPHATEST == 1);
+
+	enum
+	{
+		#define ALLOW_MERGE(a, b) (1 << ((a)|((b)<<2)))
+
+		MERGE_LUT =
+			ALLOW_MERGE (0, 0) |
+			ALLOW_MERGE (0, 1) |
+			ALLOW_MERGE (0, 2) |
+			ALLOW_MERGE (0, 3) |
+
+			ALLOW_MERGE (1, 0) |
+			ALLOW_MERGE (1, 1) |
+			ALLOW_MERGE (1, 2) |
+			ALLOW_MERGE (1, 3) |
+
+			ALLOW_MERGE (2, 0) |
+			ALLOW_MERGE (2, 2) |
+
+			ALLOW_MERGE (3, 0) |
+			ALLOW_MERGE (3, 2)
+		,
+
+		#undef ALLOW_MERGE
+	};
+
+	return (MERGE_LUT & (1 << (mask_a | (mask_b << 2)))) != 0;
+}
+
+/*
+=============
+R_DrawBrushModels
+=============
+*/
+void R_DrawBrushModels (entity_t **ents, int count)
+{
+	qboolean translucent;
+	if (!count)
+		return;
+	translucent = (ents[0] != &cl_entities[0]) && !ENTALPHA_OPAQUE (ents[0]->alpha);
+	if (!translucent || r_oit.value)
+	{
+		R_DrawBrushModels_Real (ents, count, BP_SOLID, translucent);
+		R_DrawBrushModels_Real (ents, count, BP_ALPHATEST, translucent);
+	}
+	else
+	{
+		int i, j;
+		for (i = 0; i < count; /**/)
+		{
+			uint32_t mask = R_GetBModelAlphaPasses (ents[i]);
+			if (!mask)
+			{
+				i++;
+				continue;
+			}
+			for (j = i + 1; j < count; j++)
+			{
+				uint32_t nextmask = R_GetBModelAlphaPasses (ents[j]);
+				if (!R_CanMergeBModelAlphaPasses (mask, nextmask))
+					break;
+				mask |= nextmask;
+			}
+			if (mask & (1 << BP_SOLID))
+				R_DrawBrushModels_Real (ents + i, j - i, BP_SOLID, true);
+			if (mask & (1 << BP_ALPHATEST))
+				R_DrawBrushModels_Real (ents + i, j - i, BP_ALPHATEST, true);
+			i = j;
+		}
+	}
+}
+
+/*
+=============
+R_DrawBrushModels_SkyLayers
+=============
+*/
+void R_DrawBrushModels_SkyLayers (entity_t **ents, int count)
+{
+	R_DrawBrushModels_Real (ents, count, BP_SKYLAYERS, false);
+}
+
+/*
+=============
+R_DrawBrushModels_SkyCubemap
+=============
+*/
+void R_DrawBrushModels_SkyCubemap (entity_t **ents, int count)
+{
+	R_DrawBrushModels_Real (ents, count, BP_SKYCUBEMAP, false);
+}
+
+/*
+=============
+R_DrawBrushModels_SkyStencil
+=============
+*/
+void R_DrawBrushModels_SkyStencil (entity_t **ents, int count)
+{
+	R_DrawBrushModels_Real (ents, count, BP_SKYSTENCIL, false);
+}
+
+/*
+=============
+R_DrawBrushModels_ShowTris
+=============
+*/
+void R_DrawBrushModels_ShowTris (entity_t **ents, int count)
+{
+	R_DrawBrushModels_Real (ents, count, BP_SHOWTRIS, false);
 }

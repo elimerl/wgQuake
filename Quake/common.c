@@ -24,11 +24,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "q_ctype.h"
+#include <time.h>
 #include <errno.h>
-
 #include "miniz.h"
+#include "unicode_translit.h"
 
-static char *largv[MAX_NUM_ARGVS + 1];
+static const char *largv[MAX_NUM_ARGVS + 1];
 static char argvdummy[] = " ";
 
 int safemode;
@@ -39,6 +40,8 @@ cvar_t registered = {
 cvar_t cmdline = {"cmdline", "",
                   CVAR_ROM /*|CVAR_SERVERINFO*/}; /* sending cmdline upon
                                                      CCREQ_RULE_INFO is evil */
+cvar_t language = {"language", "auto",
+                   CVAR_ARCHIVE}; /* for 2021 rerelease text */
 
 static qboolean com_modified; // set true if using non-id files
 
@@ -55,14 +58,14 @@ static void COM_Path_f(void);
 #define PAK0_COUNT_V091 308 /* id1/pak0.pak - v0.91/0.92, not supported */
 #define PAK0_CRC_V091 28804 /* id1/pak0.pak - v0.91/0.92, not supported */
 
-char com_token[1024];
+THREAD_LOCAL char com_token[1024];
 int com_argc;
-char **com_argv;
+const char **com_argv;
 
 #define CMDLINE_LENGTH 256 /* johnfitz -- mirrored in cmd.c */
 char com_cmdline[CMDLINE_LENGTH];
 
-qboolean standard_quake = true, rogue, hipnotic;
+qboolean standard_quake = true, rogue, hipnotic, quake64;
 
 // this graphic needs to be in the pak file to use registered features
 static unsigned short pop[] = {
@@ -168,8 +171,8 @@ void Vec_Grow(void **pvec, size_t element_size, size_t count) {
     else
       new_buffer = malloc(total_size);
     if (!new_buffer)
-      Sys_Error("Vec_Grow: failed to allocate %lu bytes\n",
-                (unsigned long)total_size);
+      Sys_Error("Vec_Grow: failed to allocate %" SDL_PRIu64 " bytes\n",
+                (uint64_t)total_size);
 
     *pvec = 1 + (vec_header_t *)new_buffer;
     VEC_HEADER(*pvec) = header;
@@ -197,6 +200,10 @@ void Vec_Free(void **pvec) {
   }
 }
 
+void MultiString_Append(char **pvec, const char *str) {
+  Vec_Append((void **)pvec, 1, str, strlen(str) + 1);
+}
+
 /*
 ============================================================================
 
@@ -204,6 +211,65 @@ void Vec_Free(void **pvec) {
 
 ============================================================================
 */
+
+int q_strnaturalcmp(const char *s1, const char *s2) {
+  qboolean neg1, neg2, sign1, sign2;
+
+  if (s1 == s2)
+    return 0;
+
+  neg1 = *s1 == '-';
+  neg2 = *s2 == '-';
+  sign1 = neg1 || *s1 == '+';
+  sign2 = neg2 || *s2 == '+';
+
+  // early out if strings start with different signs followed by digits
+  if (neg1 != neg2 && q_isdigit(s1[sign1]) && q_isdigit(s1[sign2]))
+    return neg2 - neg1;
+
+skip_prefix:
+  while (*s1 && !q_isdigit(*s1) && q_toupper(*s1) == q_toupper(*s2)) {
+    s1++;
+    s2++;
+    continue;
+  }
+
+  if (q_isdigit(*s1) && q_isdigit(*s2)) {
+    const char *begin1 = s1++;
+    const char *begin2 = s2++;
+    int diff, sign;
+
+    while (*begin1 == '0')
+      begin1++;
+    while (*begin2 == '0')
+      begin2++;
+
+    while (q_isdigit(*s1))
+      s1++;
+    while (q_isdigit(*s2))
+      s2++;
+
+    sign = neg1 ? -1 : 1;
+
+    diff = (s1 - begin1) - (s2 - begin2);
+    if (diff)
+      return diff * sign;
+
+    while (begin1 != s1) {
+      diff = *begin1++ - *begin2++;
+      if (diff)
+        return diff * sign;
+    }
+
+    // We only support negative numbers at the beginning of strings so that
+    // "-2" is sorted before "-1", but "file-2345.ext" *after* "file-1234.ext".
+    neg1 = neg2 = false;
+
+    goto skip_prefix;
+  }
+
+  return q_toupper(*s1) - q_toupper(*s2);
+}
 
 int q_strcasecmp(const char *s1, const char *s2) {
   const char *p1 = s1;
@@ -243,6 +309,9 @@ int q_strncasecmp(const char *s1, const char *s2, size_t n) {
 
 char *q_strcasestr(const char *haystack, const char *needle) {
   const size_t len = strlen(needle);
+
+  if (!len)
+    return (char *)haystack;
 
   while (*haystack) {
     if (!q_strncasecmp(haystack, needle, len))
@@ -533,63 +602,6 @@ float Q_atof(const char *str) {
 
   return val * sign;
 }
-
-/*
-============================================================================
-
-                                        BYTE ORDER FUNCTIONS
-
-============================================================================
-*/
-
-qboolean host_bigendian;
-
-short (*BigShort)(short l);
-short (*LittleShort)(short l);
-int (*BigLong)(int l);
-int (*LittleLong)(int l);
-float (*BigFloat)(float l);
-float (*LittleFloat)(float l);
-
-short ShortSwap(short l) {
-  byte b1, b2;
-
-  b1 = l & 255;
-  b2 = (l >> 8) & 255;
-
-  return (b1 << 8) + b2;
-}
-
-short ShortNoSwap(short l) { return l; }
-
-int LongSwap(int l) {
-  byte b1, b2, b3, b4;
-
-  b1 = l & 255;
-  b2 = (l >> 8) & 255;
-  b3 = (l >> 16) & 255;
-  b4 = (l >> 24) & 255;
-
-  return ((int)b1 << 24) + ((int)b2 << 16) + ((int)b3 << 8) + b4;
-}
-
-int LongNoSwap(int l) { return l; }
-
-float FloatSwap(float f) {
-  union {
-    float f;
-    byte b[4];
-  } dat1, dat2;
-
-  dat1.f = f;
-  dat2.b[0] = dat1.b[3];
-  dat2.b[1] = dat1.b[2];
-  dat2.b[2] = dat1.b[1];
-  dat2.b[3] = dat1.b[0];
-  return dat2.f;
-}
-
-float FloatNoSwap(float f) { return f; }
 
 /*
 ==============================================================================
@@ -928,6 +940,34 @@ void SZ_Print(sizebuf_t *buf, const char *data) {
 
 /*
 ============
+COM_FirstPathSep
+
+Returns a pointer to the first path separator, if any, or the end of the string
+============
+*/
+const char *COM_FirstPathSep(const char *path) {
+  while (*path && !Sys_IsPathSep(*path))
+    path++;
+  return path;
+}
+
+/*
+============
+COM_NormalizePath
+
+Replaces all path separators with forward slashes
+============
+*/
+void COM_NormalizePath(char *path) {
+  while (*path) {
+    if (Sys_IsPathSep(*path))
+      *path = '/';
+    path++;
+  }
+}
+
+/*
+============
 COM_SkipPath
 ============
 */
@@ -1075,6 +1115,48 @@ void COM_AddExtension(char *path, const char *extension, size_t len) {
 }
 
 /*
+================
+COM_TintSubstring
+================
+*/
+char *COM_TintSubstring(const char *in, const char *substr, char *out,
+                        size_t outsize) {
+  int l;
+  char *m = out;
+  q_strlcpy(out, in, outsize);
+  if (*substr) {
+    while ((m = q_strcasestr(m, substr))) {
+      for (l = 0; substr[l]; l++)
+        if (m[l] > ' ')
+          m[l] |= 0x80;
+      m += l;
+    }
+  }
+  return out;
+}
+
+/*
+================
+COM_TintString
+================
+*/
+char *COM_TintString(const char *in, char *out, size_t outsize) {
+  char *ret = out;
+  if (!outsize)
+    return "";
+  --outsize;
+  while (*in && outsize > 0) {
+    char c = *in++;
+    if (c > ' ')
+      c |= 0x80;
+    *out++ = c;
+    --outsize;
+  }
+  *out++ = '\0';
+  return ret;
+}
+
+/*
 ==============
 COM_ParseEx
 
@@ -1187,10 +1269,10 @@ Returns the position (1 to argc-1) in the program's argument list
 where the given parameter apears, or 0 if not present
 ================
 */
-int COM_CheckParm(const char *parm) {
+int COM_CheckParmNext(int last, const char *parm) {
   int i;
 
-  for (i = 1; i < com_argc; i++) {
+  for (i = last + 1; i < com_argc; i++) {
     if (!com_argv[i])
       continue; // NEXTSTEP sometimes clears appkit vars.
     if (!Q_strcmp(parm, com_argv[i]))
@@ -1199,6 +1281,7 @@ int COM_CheckParm(const char *parm) {
 
   return 0;
 }
+int COM_CheckParm(const char *parm) { return COM_CheckParmNext(0, parm); }
 
 /*
 ================
@@ -1228,7 +1311,7 @@ static void COM_CheckRegistered(void) {
           " subdirectory containing pak0.pak and pak1.pak, "
           "or use the -basedir command-line option to specify another "
           "directory.",
-          com_basedir);
+          com_basedirs[0]);
     return;
   }
 
@@ -1308,47 +1391,25 @@ void COM_InitArgv(int argc, char **argv) {
 
 /*
 ================
+COM_AddArg
+
+Returns the index of the new argument or -1 on overflow
+================
+*/
+int COM_AddArg(const char *arg) {
+  if (com_argc >= MAX_NUM_ARGVS)
+    return -1;
+  com_argv[com_argc] = arg;
+  com_argv[com_argc + 1] = argvdummy;
+  return com_argc++;
+}
+
+/*
+================
 COM_Init
 ================
 */
 void COM_Init(void) {
-  int i = 0x12345678;
-  /*    U N I X */
-
-  /*
-  BE_ORDER:  12 34 56 78
-             U  N  I  X
-
-  LE_ORDER:  78 56 34 12
-             X  I  N  U
-
-  PDP_ORDER: 34 12 78 56
-             N  U  X  I
-  */
-  if (*(char *)&i == 0x12)
-    host_bigendian = true;
-  else if (*(char *)&i == 0x78)
-    host_bigendian = false;
-  else /* if ( *(char *)&i == 0x34 ) */
-    Sys_Error("Unsupported endianism.");
-
-  if (host_bigendian) {
-    BigShort = ShortNoSwap;
-    LittleShort = ShortSwap;
-    BigLong = LongNoSwap;
-    LittleLong = LongSwap;
-    BigFloat = FloatNoSwap;
-    LittleFloat = FloatSwap;
-  } else /* assumed LITTLE_ENDIAN. */
-  {
-    BigShort = ShortSwap;
-    LittleShort = ShortNoSwap;
-    BigLong = LongSwap;
-    LittleLong = LongNoSwap;
-    BigFloat = FloatSwap;
-    LittleFloat = FloatNoSwap;
-  }
-
   if (COM_CheckParm("-fitz"))
     fitzmode = true;
 }
@@ -1393,7 +1454,7 @@ QUAKE FILESYSTEM
 =============================================================================
 */
 
-int com_filesize;
+THREAD_LOCAL qfileofs_t com_filesize;
 
 //
 // on-disk pakfile
@@ -1411,9 +1472,14 @@ typedef struct {
 
 #define MAX_FILES_IN_PACK 2048
 
+char com_gamenames[1024]; // eg: "hipnotic;quoth;warp" ... no id1
 char com_gamedir[MAX_OSPATH];
-char com_basedir[MAX_OSPATH];
-int file_from_pak; // ZOID: global indicating that file came from a pak
+char com_basedirs[MAX_BASEDIRS][MAX_OSPATH];
+int com_numbasedirs;
+char com_nightdivedir[MAX_OSPATH];
+char com_userprefdir[MAX_OSPATH];
+THREAD_LOCAL int
+    file_from_pak; // ZOID: global indicating that file came from a pak
 
 searchpath_t *com_searchpaths;
 searchpath_t *com_base_searchpaths;
@@ -1446,9 +1512,6 @@ void COM_WriteFile(const char *filename, const void *data, int len) {
   int handle;
   char name[MAX_OSPATH];
 
-  Sys_mkdir(com_gamedir); // johnfitz -- if we've switched to a nonexistant
-                          // gamedir, create it now so we don't crash
-
   q_snprintf(name, sizeof(name), "%s/%s", com_gamedir, filename);
 
   handle = Sys_FileOpenWrite(name);
@@ -1460,6 +1523,96 @@ void COM_WriteFile(const char *filename, const void *data, int len) {
   Sys_Printf("COM_WriteFile: %s\n", name);
   Sys_FileWrite(handle, data, len);
   Sys_FileClose(handle);
+}
+
+/*
+============
+COM_WriteFile_OSPath
+============
+*/
+qboolean COM_WriteFile_OSPath(const char *filename, const void *data,
+                              size_t len) {
+  qboolean ret = false;
+  FILE *f = Sys_fopen(filename, "wb");
+
+  if (f) {
+    ret = fwrite(data, len, 1, f) == 1;
+    fclose(f);
+    if (!ret)
+      Sys_remove(filename);
+  }
+
+  return ret;
+}
+
+/*
+============
+COM_TempSuffix
+============
+*/
+char *COM_TempSuffix(unsigned seq) {
+  static const char base64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=#";
+  static char buf[64];
+  time_t now = 0;
+  int r, len = 0, maxlen = sizeof(buf) - 1;
+
+  time(&now);
+  while (now && len < maxlen) {
+    buf[len++] = base64[now & 63];
+    now >>= 6;
+  }
+
+  r = rand();
+  while (r && len < maxlen) {
+    buf[len++] = base64[r & 63];
+    r >>= 6;
+  }
+
+  while (seq && len < maxlen) {
+    buf[len++] = base64[seq & 63];
+    seq >>= 6;
+  }
+
+  buf[len] = '\0';
+
+  return buf;
+}
+
+/*
+============
+COM_DescribeDuration
+
+Describes the given duration, e.g. "3 minutes"
+============
+*/
+void COM_DescribeDuration(char *out, size_t outsize, double seconds) {
+  const double SECOND = 1;
+  const double MINUTE = 60 * SECOND;
+  const double HOUR = 60 * MINUTE;
+  const double DAY = 24 * HOUR;
+  const double WEEK = 7 * DAY;
+  const double MONTH = 30.436875 * DAY;
+  const double YEAR = 365.2425 * DAY;
+
+  seconds = fabs(seconds);
+
+  if (seconds < 1)
+    q_strlcpy(out, "moments", outsize);
+  else if (seconds < 60 * SECOND)
+    q_snprintf(out, outsize, "%i second%s", PLURAL(seconds));
+  else if (seconds < 90 * MINUTE)
+    q_snprintf(out, outsize, "%i minute%s", PLURAL(seconds / MINUTE));
+  else if (seconds < DAY)
+    q_snprintf(out, outsize, "%i hour%s", PLURAL(seconds / HOUR));
+  else if (seconds < WEEK)
+    q_snprintf(out, outsize, "%i day%s", PLURAL(seconds / DAY));
+  else if (seconds < MONTH)
+    q_snprintf(out, outsize, "%i week%s", PLURAL(seconds / WEEK));
+  else if (seconds < YEAR)
+    q_snprintf(out, outsize, "%i month%s", PLURAL(seconds / MONTH));
+  else
+    q_snprintf(out, outsize, "%i year%s", PLURAL(seconds / YEAR));
 }
 
 /*
@@ -1484,13 +1637,13 @@ void COM_CreatePath(char *path) {
 COM_filelength
 ================
 */
-long COM_filelength(FILE *f) {
-  long pos, end;
+qfileofs_t COM_filelength(FILE *f) {
+  qfileofs_t pos, end;
 
-  pos = ftell(f);
-  fseek(f, 0, SEEK_END);
-  end = ftell(f);
-  fseek(f, pos, SEEK_SET);
+  pos = Sys_ftell(f);
+  Sys_fseek(f, 0, SEEK_END);
+  end = Sys_ftell(f);
+  Sys_fseek(f, pos, SEEK_SET);
 
   return end;
 }
@@ -1537,7 +1690,7 @@ static int COM_FindFile(const char *filename, int *handle, FILE **file,
           Sys_FileSeek(pak->handle, pak->files[i].filepos);
           return com_filesize;
         } else if (file) { /* open a new file on the pakfile */
-          *file = fopen(pak->filename, "rb");
+          *file = Sys_fopen(pak->filename, "rb");
           if (*file)
             fseek(*file, pak->files[i].filepos, SEEK_SET);
           return com_filesize;
@@ -1565,7 +1718,7 @@ static int COM_FindFile(const char *filename, int *handle, FILE **file,
         *handle = i;
         return com_filesize;
       } else if (file) {
-        *file = fopen(netpath, "rb");
+        *file = Sys_fopen(netpath, "rb");
         com_filesize = (*file == NULL) ? -1 : COM_filelength(*file);
         return com_filesize;
       } else {
@@ -1574,14 +1727,16 @@ static int COM_FindFile(const char *filename, int *handle, FILE **file,
     }
   }
 
-  if (strcmp(COM_FileGetExtension(filename), "pcx") != 0 &&
-      strcmp(COM_FileGetExtension(filename), "tga") != 0 &&
-      strcmp(COM_FileGetExtension(filename), "lit") != 0 &&
-      strcmp(COM_FileGetExtension(filename), "vis") != 0 &&
-      strcmp(COM_FileGetExtension(filename), "ent") != 0)
-    Con_DPrintf("FindFile: can't find %s\n", filename);
-  else
-    Con_DPrintf2("FindFile: can't find %s\n", filename);
+  if (developer.value) {
+    const char *ext = COM_FileGetExtension(filename);
+
+    if (strcmp(ext, "pcx") != 0 && strcmp(ext, "tga") != 0 &&
+        strcmp(ext, "lit") != 0 && strcmp(ext, "vis") != 0 &&
+        strcmp(ext, "ent") != 0)
+      Con_DPrintf("FindFile: can't find %s\n", filename);
+    else
+      Con_DPrintf2("FindFile: can't find %s\n", filename);
+  }
 
   if (handle)
     *handle = -1;
@@ -1653,16 +1808,8 @@ Filename are reletive to the quake directory.
 Allways appends a 0 byte.
 ============
 */
-#define LOADFILE_ZONE 0
-#define LOADFILE_HUNK 1
-#define LOADFILE_TEMPHUNK 2
-#define LOADFILE_CACHE 3
-#define LOADFILE_STACK 4
-#define LOADFILE_MALLOC 5
-
-static byte *loadbuf;
-static cache_user_t *loadcache;
-static int loadsize;
+#define LOADFILE_HUNK 0
+#define LOADFILE_MALLOC 1
 
 byte *COM_LoadFile(const char *path, int usehunk, unsigned int *path_id) {
   int h;
@@ -1682,22 +1829,7 @@ byte *COM_LoadFile(const char *path, int usehunk, unsigned int *path_id) {
 
   switch (usehunk) {
   case LOADFILE_HUNK:
-    buf = (byte *)Hunk_AllocName(len + 1, base);
-    break;
-  case LOADFILE_TEMPHUNK:
-    buf = (byte *)Hunk_TempAlloc(len + 1);
-    break;
-  case LOADFILE_ZONE:
-    buf = (byte *)Z_Malloc(len + 1);
-    break;
-  case LOADFILE_CACHE:
-    buf = (byte *)Cache_Alloc(loadcache, len + 1, base);
-    break;
-  case LOADFILE_STACK:
-    if (len < loadsize)
-      buf = loadbuf;
-    else
-      buf = (byte *)Hunk_TempAlloc(len + 1);
+    buf = (byte *)Hunk_AllocNameNoFill(len + 1, base);
     break;
   case LOADFILE_MALLOC:
     buf = (byte *)malloc(len + 1);
@@ -1723,32 +1855,6 @@ byte *COM_LoadHunkFile(const char *path, unsigned int *path_id) {
   return COM_LoadFile(path, LOADFILE_HUNK, path_id);
 }
 
-byte *COM_LoadZoneFile(const char *path, unsigned int *path_id) {
-  return COM_LoadFile(path, LOADFILE_ZONE, path_id);
-}
-
-byte *COM_LoadTempFile(const char *path, unsigned int *path_id) {
-  return COM_LoadFile(path, LOADFILE_TEMPHUNK, path_id);
-}
-
-void COM_LoadCacheFile(const char *path, struct cache_user_s *cu,
-                       unsigned int *path_id) {
-  loadcache = cu;
-  COM_LoadFile(path, LOADFILE_CACHE, path_id);
-}
-
-// uses temp hunk if larger than bufsize
-byte *COM_LoadStackFile(const char *path, void *buffer, int bufsize,
-                        unsigned int *path_id) {
-  byte *buf;
-
-  loadbuf = (byte *)buffer;
-  loadsize = bufsize;
-  buf = COM_LoadFile(path, LOADFILE_STACK, path_id);
-
-  return buf;
-}
-
 // returns malloc'd memory
 byte *COM_LoadMallocFile(const char *path, unsigned int *path_id) {
   return COM_LoadFile(path, LOADFILE_MALLOC, path_id);
@@ -1764,7 +1870,7 @@ byte *COM_LoadMallocFile_TextMode_OSPath(const char *path, long *len_out) {
   // each line.
   // TODO: could handle in a way that allows loading CRLF savegames on mac/linux
   // without the junk characters appearing.
-  f = fopen(path, "rt");
+  f = Sys_fopen(path, "rt");
   if (f == NULL)
     return NULL;
 
@@ -1795,23 +1901,60 @@ byte *COM_LoadMallocFile_TextMode_OSPath(const char *path, long *len_out) {
   return data;
 }
 
+char *COM_NormalizeLineEndings(char *buffer) {
+  char *src, *dst;
+
+  src = dst = buffer;
+
+  while (*src) {
+    if (src == dst) {
+      while (*src && *src != '\r')
+        src++;
+      dst = src;
+    } else {
+      while (*src && *src != '\r')
+        *dst++ = *src++;
+    }
+
+    if (!*src)
+      break;
+
+    src++;
+    if (*src != '\n')
+      *dst++ = '\n';
+  }
+
+  *dst = '\0';
+
+  return buffer;
+}
+
 const char *COM_ParseIntNewline(const char *buffer, int *value) {
-  int consumed = 0;
-  sscanf(buffer, "%i\n%n", value, &consumed);
-  return buffer + consumed;
+  char *end;
+  *value = strtol(buffer, &end, 10);
+  while (q_isspace(*end))
+    ++end;
+  return end;
 }
 
 const char *COM_ParseFloatNewline(const char *buffer, float *value) {
-  int consumed = 0;
-  sscanf(buffer, "%f\n%n", value, &consumed);
-  return buffer + consumed;
+  char *end;
+  *value = strtof(buffer, &end);
+  while (q_isspace(*end))
+    ++end;
+  return end;
 }
 
 const char *COM_ParseStringNewline(const char *buffer) {
-  int consumed = 0;
-  com_token[0] = '\0';
-  sscanf(buffer, "%1023s\n%n", com_token, &consumed);
-  return buffer + consumed;
+  int i;
+  for (i = 0; i < countof(com_token) - 1; i++)
+    if (!buffer[i] || q_isspace(buffer[i]))
+      break;
+  memcpy(com_token, buffer, i);
+  com_token[i] = '\0';
+  while (q_isspace(buffer[i]))
+    ++i;
+  return buffer + i;
 }
 
 /*
@@ -1832,7 +1975,6 @@ static pack_t *COM_LoadPackFile(const char *packfile) {
   pack_t *pack;
   int packhandle;
   dpackfile_t info[MAX_FILES_IN_PACK];
-  unsigned short crc;
 
   if (Sys_FileOpenRead(packfile, &packhandle) == -1)
     return NULL;
@@ -1870,11 +2012,11 @@ static pack_t *COM_LoadPackFile(const char *packfile) {
     Sys_Error("Error reading %s", packfile);
 
   // crc the directory to check for modifications
-  CRC_Init(&crc);
-  for (i = 0; i < header.dirlen; i++)
-    CRC_ProcessByte(&crc, ((byte *)info)[i]);
-  if (crc != PAK0_CRC_V106 && crc != PAK0_CRC_V101 && crc != PAK0_CRC_V100)
-    com_modified = true;
+  if (!com_modified) {
+    unsigned short crc = CRC_Block(info, header.dirlen);
+    if (crc != PAK0_CRC_V106 && crc != PAK0_CRC_V101 && crc != PAK0_CRC_V100)
+      com_modified = true;
+  }
 
   // parse the directory
   for (i = 0; i < numpackfiles; i++) {
@@ -1893,20 +2035,88 @@ static pack_t *COM_LoadPackFile(const char *packfile) {
   return pack;
 }
 
+const char *COM_GetGameNames(qboolean full) {
+  if (full) {
+    if (*com_gamenames)
+      return va("%s;%s", GAMENAME, com_gamenames);
+    else
+      return GAMENAME;
+  }
+  return com_gamenames;
+  //	return COM_SkipPath(com_gamedir);
+}
+
+/*
+=================
+COM_AddEnginePak
+=================
+*/
+static void COM_AddEnginePak(void) {
+  int i;
+  char pakfile[MAX_OSPATH];
+  pack_t *pak = NULL;
+  qboolean modified = com_modified;
+
+  if (host_parms->exedir) {
+    q_snprintf(pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, host_parms->exedir);
+    pak = COM_LoadPackFile(pakfile);
+  }
+
+  if (!pak) {
+    q_snprintf(pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, host_parms->basedir);
+    pak = COM_LoadPackFile(pakfile);
+  }
+
+  if (!pak) {
+    for (i = 0; i < com_numbasedirs; i++) {
+      q_snprintf(pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, com_basedirs[i]);
+      pak = COM_LoadPackFile(pakfile);
+      if (pak)
+        break;
+    }
+  }
+
+  if (pak) {
+    searchpath_t *search = (searchpath_t *)Z_Malloc(sizeof(searchpath_t));
+    search->path_id = com_searchpaths ? com_searchpaths->path_id : 1u;
+    search->pack = pak;
+    search->next = com_searchpaths;
+    com_searchpaths = search;
+  }
+
+  com_modified = modified;
+}
+
 /*
 =================
 COM_AddGameDirectory -- johnfitz -- modified based on topaz's tutorial
 =================
 */
-static void COM_AddGameDirectory(const char *base, const char *dir) {
-  int i;
+void COM_AddGameDirectory(const char *dir) {
+  const char *base;
+  int i, j;
   unsigned int path_id;
   searchpath_t *search;
-  pack_t *pak, *qspak;
+  pack_t *pak;
   char pakfile[MAX_OSPATH];
-  qboolean been_here = false;
 
-  q_strlcpy(com_gamedir, va("%s/%s", base, dir), sizeof(com_gamedir));
+  if (*com_gamenames)
+    q_strlcat(com_gamenames, ";", sizeof(com_gamenames));
+  q_strlcat(com_gamenames, dir, sizeof(com_gamenames));
+
+  // quakespasm enables mission pack flags automatically,
+  // so e.g. -game rogue works without breaking the hud
+  if (!q_strcasecmp(dir, "rogue")) {
+    rogue = true;
+    standard_quake = false;
+  }
+  if (!q_strcasecmp(dir, "hipnotic") || !q_strcasecmp(dir, "quoth")) {
+    hipnotic = true;
+    standard_quake = false;
+  }
+  if (!q_strcasecmp(dir, "q64")) {
+    quake64 = true;
+  }
 
   // assign a path_id to this game directory
   if (com_searchpaths)
@@ -1914,63 +2124,196 @@ static void COM_AddGameDirectory(const char *base, const char *dir) {
   else
     path_id = 1U;
 
-_add_path:
-  // add the directory to the search path
-  search = (searchpath_t *)Z_Malloc(sizeof(searchpath_t));
-  search->path_id = path_id;
-  q_strlcpy(search->filename, com_gamedir, sizeof(search->filename));
-  search->next = com_searchpaths;
-  com_searchpaths = search;
+  for (j = 0; j < com_numbasedirs; j++) {
+    base = com_basedirs[j];
+    q_snprintf(com_gamedir, sizeof(com_gamedir), "%s/%s", base, dir);
 
-  // add any pak files in the format pak0.pak pak1.pak, ...
-  for (i = 0;; i++) {
-    q_snprintf(pakfile, sizeof(pakfile), "%s/pak%i.pak", com_gamedir, i);
-    pak = COM_LoadPackFile(pakfile);
-    if (i != 0 || path_id != 1 || fitzmode)
-      qspak = NULL;
-    else {
-      qboolean old = com_modified;
-      if (been_here)
-        base = host_parms->userdir;
-      q_snprintf(pakfile, sizeof(pakfile), "%s/quakespasm.pak", base);
-      qspak = COM_LoadPackFile(pakfile);
-      com_modified = old;
-    }
-    if (pak) {
+    // add the directory to the search path
+    search = (searchpath_t *)Z_Malloc(sizeof(searchpath_t));
+    search->path_id = path_id;
+    q_strlcpy(search->filename, com_gamedir, sizeof(search->filename));
+    search->next = com_searchpaths;
+    com_searchpaths = search;
+
+    // add any pak files in the format pak0.pak pak1.pak, ...
+    for (i = 0;; i++) {
+      q_snprintf(pakfile, sizeof(pakfile), "%s/pak%i.pak", com_gamedir, i);
+      pak = COM_LoadPackFile(pakfile);
+      if (!pak)
+        break;
+
       search = (searchpath_t *)Z_Malloc(sizeof(searchpath_t));
       search->path_id = path_id;
       search->pack = pak;
       search->next = com_searchpaths;
       com_searchpaths = search;
-    }
-    if (qspak) {
-      search = (searchpath_t *)Z_Malloc(sizeof(searchpath_t));
-      search->path_id = path_id;
-      search->pack = qspak;
-      search->next = com_searchpaths;
-      com_searchpaths = search;
-    }
-    if (!pak)
-      break;
-  }
 
-  if (!been_here && host_parms->userdir != host_parms->basedir) {
-    been_here = true;
-    q_strlcpy(com_gamedir, va("%s/%s", host_parms->userdir, dir),
-              sizeof(com_gamedir));
-    Sys_mkdir(com_gamedir);
-    goto _add_path;
+      // add engine pak after pak0.pak
+      if (i == 0 && j == 0 && path_id == 1u && !fitzmode)
+        COM_AddEnginePak();
+    }
+  }
+}
+
+void COM_ResetGameDirectories(const char *newgamedirs) {
+  const char *newpath, *path;
+  searchpath_t *search;
+  // Kill the extra game if it is loaded
+  while (com_searchpaths != com_base_searchpaths) {
+    if (com_searchpaths->pack) {
+      Sys_FileClose(com_searchpaths->pack->handle);
+      Z_Free(com_searchpaths->pack->files);
+      Z_Free(com_searchpaths->pack);
+    }
+    search = com_searchpaths->next;
+    Z_Free(com_searchpaths);
+    com_searchpaths = search;
+  }
+  hipnotic = false;
+  rogue = false;
+  quake64 = false;
+  standard_quake = true;
+  // wipe the list of mod gamedirs
+  *com_gamenames = 0;
+  // reset this too
+  q_strlcpy(com_gamedir,
+            va("%s/%s", com_basedirs[com_numbasedirs - 1], GAMENAME),
+            sizeof(com_gamedir));
+
+  for (newpath = newgamedirs; newpath && *newpath;) {
+    char *e = strchr(newpath, ';');
+    if (e)
+      *e++ = 0;
+
+    if (!q_strcasecmp(GAMENAME, newpath))
+      path = NULL;
+    else
+      for (path = newgamedirs; path < newpath; path += strlen(path) + 1) {
+        if (!q_strcasecmp(path, newpath))
+          break;
+      }
+
+    if (path == newpath) // not already loaded
+      COM_AddGameDirectory(newpath);
+    newpath = e;
   }
 }
 
 //==============================================================================
 // johnfitz -- dynamic gamedir stuff -- modified by QuakeSpasm team.
 //==============================================================================
+
+/*
+=================
+COM_GameDirExists
+
+Checks if a gamedir exists in any basedir
+=================
+*/
+static qboolean COM_GameDirExists(const char *game) {
+  int i;
+
+  for (i = 0; i < com_numbasedirs; i++)
+    if (Sys_FileType(va("%s/%s", com_basedirs[i], game)) == FS_ENT_DIRECTORY)
+      return true;
+
+  return false;
+}
+
+/*
+=================
+COM_ValidateGameDirs
+=================
+*/
+static qboolean COM_ValidateGameDirs(const char *newgamedirs) {
+  char dirscopy[1024];
+  char *newpath;
+
+  q_strlcpy(dirscopy, newgamedirs, sizeof(dirscopy));
+
+  // parse the individual semicolon-separated gamedirs (e.g. id1;ad;ad_heresp1)
+  for (newpath = dirscopy; newpath && *newpath;) {
+    char *p = strchr(newpath, ';');
+    if (p)
+      *p++ = 0;
+
+    if (!COM_GameDirExists(newpath)) {
+      Con_Printf("No such game directory \"%s\"\n", newpath);
+      return false;
+    }
+
+    newpath = p;
+  }
+
+  return true;
+}
+
+/*
+=================
+COM_SwitchGame
+=================
+*/
+void COM_SwitchGame(const char *paths) {
+  extern cvar_t max_edicts;
+  if (!q_strcasecmp(paths, COM_GetGameNames(true))) {
+    Con_Printf("\"game\" is already \"%s\"\n", COM_GetGameNames(true));
+    return;
+  }
+
+  if (!COM_ValidateGameDirs(paths))
+    return;
+
+  Host_WaitForSaveThread();
+
+  com_modified = true;
+
+  // Kill the server
+  CL_Disconnect();
+  Host_ShutdownServer(true);
+
+  // Write config file
+  Host_WriteConfiguration();
+
+  // stop parsing map files before changing file system search paths
+  ExtraMaps_Clear();
+
+  COM_ResetGameDirectories(paths);
+
+  // clear out and reload appropriate data
+  Cache_Flush();
+  Mod_ResetAll();
+  Sky_ClearAll();
+  if (!isDedicated) {
+    TexMgr_NewGame();
+    Draw_NewGame();
+    R_NewGame();
+  }
+  ExtraMaps_Init();
+  Host_Resetdemos();
+  DemoList_Rebuild();
+  SaveList_Rebuild();
+  SkyList_Rebuild();
+  M_CheckMods();
+  Cvar_SetQuick(&max_edicts, max_edicts.default_string);
+
+  Con_Printf("\n%s\n\"game\" changed to \"%s\"\n", Con_Quakebar(40),
+             COM_GetGameNames(true));
+
+  VID_Lock();
+  Cbuf_AddText("unaliasall\n");
+  Cbuf_AddText("exec quake.rc\n");
+  Cbuf_AddText("vid_unlock\n");
+}
+
+/*
+=================
+COM_Game_f
+=================
+*/
 static void COM_Game_f(void) {
   if (Cmd_Argc() > 1) {
-    const char *p = Cmd_Argv(1);
-    const char *p2 = Cmd_Argv(2);
-    searchpath_t *search;
+    int i, pri;
+    char paths[1024];
 
     if (!registered.value) // disable shareware quake
     {
@@ -1979,128 +2322,422 @@ static void COM_Game_f(void) {
       return;
     }
 
-    if (!*p || !strcmp(p, ".") || strstr(p, "..") || strstr(p, "/") ||
-        strstr(p, "\\") || strstr(p, ":")) {
-      Con_Printf("gamedir should be a single directory name, not a path\n");
-      return;
-    }
+    *paths = 0;
+    q_strlcat(paths, GAMENAME, sizeof(paths));
+    for (pri = 0; pri <= 1; pri++) {
+      for (i = 1; i < Cmd_Argc(); i++) {
+        const char *p = Cmd_Argv(i);
+        if (!*p)
+          p = GAMENAME;
+        if (pri == 0) {
+          if (*p != '-')
+            continue;
+          p++;
+        } else if (*p == '-')
+          continue;
 
-    if (*p2) {
-      if (strcmp(p2, "-hipnotic") && strcmp(p2, "-rogue") &&
-          strcmp(p2, "-quoth")) {
-        Con_Printf("invalid mission pack argument to \"game\"\n");
-        return;
-      }
-      if (!q_strcasecmp(p, GAMENAME)) {
-        Con_Printf("no mission pack arguments to %s game\n", GAMENAME);
-        return;
-      }
-    }
-
-    if (Sys_FileType(va("%s/%s", com_basedir, p)) != FS_ENT_DIRECTORY) {
-      if (host_parms->userdir == host_parms->basedir ||
-          (Sys_FileType(va("%s/%s", host_parms->userdir, p)) !=
-           FS_ENT_DIRECTORY)) {
-        Con_Printf("No such game directory \"%s\"\n", p);
-        return;
-      }
-    }
-
-    if (!q_strcasecmp(p, COM_SkipPath(com_gamedir))) // no change
-    {
-      if (com_searchpaths->path_id > 1) { // current game not id1
-        if (*p2 && com_searchpaths->path_id == 2) {
-          // rely on QuakeSpasm extension treating '-game missionpack'
-          // as '-missionpack', otherwise would be a mess
-          if (!q_strcasecmp(p, &p2[1]))
-            goto _same;
-          Con_Printf("reloading game \"%s\" with \"%s\" support\n", p, &p2[1]);
-        } else if (!*p2 && com_searchpaths->path_id > 2)
-          Con_Printf("reloading game \"%s\" without mission pack support\n", p);
-        else
-          goto _same;
-      } else {
-      _same:
-        Con_Printf("\"game\" is already \"%s\"\n", COM_SkipPath(com_gamedir));
-        return;
-      }
-    }
-
-    com_modified = true;
-
-    // Kill the server
-    CL_Disconnect();
-    Host_ShutdownServer(true);
-
-    // Write config file
-    Host_WriteConfiguration();
-
-    // Kill the extra game if it is loaded
-    while (com_searchpaths != com_base_searchpaths) {
-      if (com_searchpaths->pack) {
-        Sys_FileClose(com_searchpaths->pack->handle);
-        Z_Free(com_searchpaths->pack->files);
-        Z_Free(com_searchpaths->pack);
-      }
-      search = com_searchpaths->next;
-      Z_Free(com_searchpaths);
-      com_searchpaths = search;
-    }
-    hipnotic = false;
-    rogue = false;
-    standard_quake = true;
-
-    if (q_strcasecmp(p, GAMENAME)) // game is not id1
-    {
-      if (*p2) {
-        COM_AddGameDirectory(com_basedir, &p2[1]);
-        standard_quake = false;
-        if (!strcmp(p2, "-hipnotic") || !strcmp(p2, "-quoth"))
-          hipnotic = true;
-        else if (!strcmp(p2, "-rogue"))
-          rogue = true;
-        if (q_strcasecmp(p, &p2[1])) // don't load twice
-          COM_AddGameDirectory(com_basedir, p);
-      } else {
-        COM_AddGameDirectory(com_basedir, p);
-        // QuakeSpasm extension: treat '-game missionpack' as '-missionpack'
-        if (!q_strcasecmp(p, "hipnotic") || !q_strcasecmp(p, "quoth")) {
-          hipnotic = true;
-          standard_quake = false;
-        } else if (!q_strcasecmp(p, "rogue")) {
-          rogue = true;
-          standard_quake = false;
+        if (!*p || !strcmp(p, ".") || strstr(p, "..") || strstr(p, "/") ||
+            strstr(p, "\\") || strstr(p, ":")) {
+          Con_Printf("gamedir should be a single directory name, not a path\n");
+          return;
         }
+
+        if (!q_strcasecmp(p, GAMENAME))
+          continue; // don't add id1, its not interesting enough.
+
+        if (*paths)
+          q_strlcat(paths, ";", sizeof(paths));
+        q_strlcat(paths, p, sizeof(paths));
       }
-    } else // just update com_gamedir
-    {
-      q_snprintf(com_gamedir, sizeof(com_gamedir), "%s/%s",
-                 (host_parms->userdir != host_parms->basedir)
-                     ? host_parms->userdir
-                     : com_basedir,
-                 GAMENAME);
     }
 
-    // clear out and reload appropriate data
-    Cache_Flush();
-    Mod_ResetAll();
-    Sky_ClearAll();
-    if (!isDedicated) {
-      TexMgr_NewGame();
-      Draw_NewGame();
-      R_NewGame();
-    }
-    ExtraMaps_NewGame();
-    Host_Resetdemos();
-    DemoList_Rebuild();
-
-    Con_Printf("\"game\" changed to \"%s\"\n", COM_SkipPath(com_gamedir));
-
-    VID_Lock();
-    Cbuf_AddText("exec quake.rc\n");
-    Cbuf_AddText("vid_unlock\n");
+    COM_SwitchGame(paths);
   } else // Diplay the current gamedir
-    Con_Printf("\"game\" is \"%s\"\n", COM_SkipPath(com_gamedir));
+    Con_Printf("\"game\" is \"%s\"\n", COM_GetGameNames(true));
+}
+
+/*
+=================
+COM_SetBaseDir
+=================
+*/
+static qboolean COM_SetBaseDir(const char *path) {
+  const char pak0[] = "/" GAMENAME "/pak0.pak";
+  char pakpath[countof(com_basedirs[0])];
+  size_t i;
+
+  i = strlen(path);
+  if (i && (path[i - 1] == '/' || path[i - 1] == '\\'))
+    --i;
+  if (i + countof(pak0) > countof(pakpath))
+    return false;
+
+  memcpy(pakpath, path, i);
+  memcpy(pakpath + i, pak0, sizeof(pak0));
+  if (!Sys_FileExists(pakpath))
+    return false;
+
+  memcpy(com_basedirs[0], path, i);
+  com_basedirs[0][i] = 0;
+  com_numbasedirs = 1;
+
+  return true;
+}
+
+/*
+=================
+COM_AddBaseDir
+=================
+*/
+static void COM_AddBaseDir(const char *path) {
+  if (com_numbasedirs >= countof(com_basedirs))
+    Sys_Error("Too many basedirs (%d)", com_numbasedirs);
+  if ((size_t)q_strlcpy(com_basedirs[com_numbasedirs++], path,
+                        sizeof(com_basedirs[0])) >= sizeof(com_basedirs[0]))
+    Sys_Error("Basedir too long (%d characters, max %d):\n%s\n",
+              (int)strlen(path), (int)sizeof(com_basedirs[0]), path);
+}
+
+/*
+=================
+COM_MigrateNightdiveUserFiles
+
+Checks the Nightdive dir for subdirs containing
+an ironwail.cfg file and moves known files over
+to the new dir
+=================
+*/
+static void COM_MigrateNightdiveUserFiles(void) {
+  const char *episodes[] = {"id1", "hipnotic", "rogue", "dopa", "mg1"};
+  const char *filetypes[] = {"cfg", "txt", "sav", "dem", "png", "jpg"};
+  const char *game, *ext;
+  char src[MAX_OSPATH];
+  char dst[MAX_OSPATH];
+  char *subdirs = NULL;
+  findfile_t *moditer, *fileiter;
+  size_t i;
+
+  // move episode dirs if they contain a config file
+  for (i = 0; i < countof(episodes); i++) {
+    const char *game = episodes[i];
+    if ((size_t)q_snprintf(src, sizeof(src), "%s/%s/%s", com_nightdivedir, game,
+                           CONFIG_NAME) >= sizeof(src))
+      continue;
+    if (!Sys_FileExists(src))
+      continue;
+    q_snprintf(src, sizeof(src), "%s/%s", com_nightdivedir, game);
+    q_snprintf(dst, sizeof(dst), "%s/%s", com_userprefdir, game);
+    Sys_rename(src, dst);
+  }
+
+  // iterate through all remaining subdirs
+  for (moditer = Sys_FindFirst(com_nightdivedir, NULL); moditer;
+       moditer = Sys_FindNext(moditer)) {
+    char srcmod[MAX_OSPATH];
+    char dstmod[MAX_OSPATH];
+    char *cfg;
+
+    if (!(moditer->attribs & FA_DIRECTORY))
+      continue;
+    if (!strcmp(moditer->name, ".") || !strcmp(moditer->name, ".."))
+      continue;
+
+    for (i = 0; i < countof(episodes); i++)
+      if (!strcmp(moditer->name, episodes[i]))
+        break;
+    if (i != countof(episodes))
+      continue;
+
+    // look for engine config
+    if ((size_t)q_snprintf(src, sizeof(src), "%s/%s/%s", com_nightdivedir,
+                           moditer->name, CONFIG_NAME) >= sizeof(src) ||
+        (size_t)q_snprintf(dst, sizeof(dst), "%s/%s/%s", com_userprefdir,
+                           moditer->name, CONFIG_NAME) >= sizeof(dst))
+      continue;
+    cfg = (char *)COM_LoadMallocFile_TextMode_OSPath(src, NULL);
+    if (!cfg)
+      continue;
+
+    // write config (and create directory structure as needed)
+    COM_WriteFile_OSPath(dst, cfg, strlen(cfg));
+    free(cfg);
+    Sys_remove(src);
+
+    // move all recognized files
+    q_snprintf(srcmod, sizeof(srcmod), "%s/%s", com_nightdivedir,
+               moditer->name);
+    q_snprintf(dstmod, sizeof(dstmod), "%s/%s", com_userprefdir, moditer->name);
+    for (fileiter = Sys_FindFirst(srcmod, NULL); fileiter;
+         fileiter = Sys_FindNext(fileiter)) {
+      if (fileiter->attribs & FA_DIRECTORY)
+        continue;
+
+      ext = COM_FileGetExtension(fileiter->name);
+      for (i = 0; i < countof(filetypes); i++)
+        if (!q_strcasecmp(ext, filetypes[i]))
+          break;
+      if (i == countof(filetypes))
+        continue;
+
+      if ((size_t)q_snprintf(src, sizeof(src), "%s/%s", srcmod,
+                             fileiter->name) < sizeof(src) &&
+          (size_t)q_snprintf(dst, sizeof(dst), "%s/%s", dstmod,
+                             fileiter->name) < sizeof(dst)) {
+        Sys_rename(src, dst);
+      }
+    }
+
+    Vec_Append((void **)&subdirs, 1, moditer->name, strlen(moditer->name) + 1);
+  }
+
+  VEC_PUSH(subdirs, '\0');
+
+  // remove empty dirs
+  for (game = subdirs; *game; game += strlen(game) + 1) {
+    q_snprintf(src, sizeof(src), "%s/%s", com_nightdivedir, game);
+    Sys_remove(game);
+  }
+
+  VEC_FREE(subdirs);
+}
+
+/*
+=================
+COM_SetBaseDirRec
+
+Looks for a valid basedir in all the ancestors of the supplied path
+Returns the path relative to that basedir if successful, NULL otherwise
+=================
+*/
+static const char *COM_SetBaseDirRec(const char *start) {
+  char buf[MAX_OSPATH];
+  size_t i, len;
+
+  q_strlcpy(buf, start, sizeof(buf));
+  len = strlen(start);
+
+  for (i = len - 1; i > 1; i--) {
+    if (Sys_IsPathSep(buf[i])) {
+      buf[i] = '\0';
+      if (COM_SetBaseDir(buf))
+        return start + i + 1;
+    }
+  }
+
+  return NULL;
+}
+
+/*
+=================
+COM_MakeRelative
+=================
+*/
+static const char *COM_MakeRelative(const char *basepath,
+                                    const char *fullpath) {
+  for (; *basepath && *fullpath; ++basepath, ++fullpath) {
+    if (Sys_IsPathSep(*basepath) != Sys_IsPathSep(*fullpath))
+      return NULL;
+    if (*basepath != *fullpath)
+      return NULL;
+  }
+
+  while (Sys_IsPathSep(*fullpath))
+    ++fullpath;
+
+  return fullpath;
+}
+
+/*
+=================
+COM_PatchCmdLine
+
+Tries to initialize basedir from a single command-line argument
+(either a mod dir or a map/save/demo file)
+
+Returns true if successful, false otherwise
+=================
+*/
+static qboolean COM_PatchCmdLine(const char *fullpath) {
+  static char game[MAX_QPATH];
+  char qpath[MAX_QPATH];
+  char printpath[MAX_OSPATH];
+  const char *relpath;
+  const char *sep;
+  int type;
+  int i;
+
+  // The path (file or directory) must exist
+  type = Sys_FileType(fullpath);
+  if (type == FS_ENT_NONE) {
+    UTF8_ToQuake(printpath, sizeof(printpath), fullpath);
+    Con_SafePrintf("\"%s\" does not exist\n", printpath);
+    return false;
+  }
+
+  // Look for the corresponding basedir
+  relpath = NULL;
+  for (i = 0; i < com_numbasedirs; i++) {
+    relpath = COM_MakeRelative(com_basedirs[i], fullpath);
+    if (relpath)
+      break;
+  }
+  if (!relpath) {
+    UTF8_ToQuake(printpath, sizeof(printpath), fullpath);
+    Con_SafePrintf("\"%s\" does not belong to an existing Quake installation\n",
+                   printpath);
+    return false;
+  }
+
+  // Game dir is the first component of the relative path
+  sep = COM_FirstPathSep(relpath);
+  if ((uintptr_t)(sep - relpath) >= sizeof(game)) {
+    UTF8_ToQuake(printpath, sizeof(printpath), relpath);
+    Con_SafePrintf("\"%s\" is too long\n", printpath);
+    return false;
+  }
+
+  UTF8_ToQuake(printpath, sizeof(printpath), relpath);
+
+  // Apply game dir
+  if (*sep) {
+    Q_strncpy(game, relpath, (int)(sep - relpath));
+    COM_AddArg("-game");
+    COM_AddArg(game);
+    relpath = sep + 1;
+  } else if (type == FS_ENT_DIRECTORY) {
+    COM_AddArg("-game");
+    COM_AddArg(relpath);
+    return true;
+  } else {
+    game[0] = '\0';
+  }
+
+  q_strlcpy(qpath, relpath, sizeof(qpath));
+  COM_NormalizePath(qpath);
+
+  // Check argument type
+  switch (type) {
+  case FS_ENT_DIRECTORY:
+    if (qpath[0]) {
+      if (q_strcasecmp(qpath, "maps") == 0) {
+        Cbuf_AddText("menu_maps\n");
+        return true;
+      }
+      UTF8_ToQuake(printpath, sizeof(printpath), qpath);
+      Con_SafePrintf("\x02subdir \"%s\" ignored\n", printpath);
+    }
+    return true;
+
+  case FS_ENT_FILE: {
+    const char *ext = COM_FileGetExtension(qpath);
+
+    // Map file
+    if (q_strcasecmp(ext, "bsp") == 0) {
+      if (!game[0]) {
+        Con_SafePrintf("Map \"%s\" not in a mod dir, ignoring.\n", printpath);
+        return false;
+      }
+      if (q_strncasecmp(qpath, "maps/", 5) != 0) {
+        Con_SafePrintf("Map \"%s\" not in the \"maps\" dir, ignoring.\n",
+                       printpath);
+        return false;
+      }
+      memmove(qpath, qpath + 5, strlen(qpath + 5) + 1);
+      Cbuf_AddText(va("menu_maps \"%s\"\n", qpath));
+      return true;
+    }
+
+    // Save file
+    if (q_strcasecmp(ext, "sav") == 0) {
+      const char *kex = game[0] ? "" : "kex";
+      Cbuf_AddText(va("load \"%s\" %s\n", qpath, kex));
+      return true;
+    }
+
+    // Demo file
+    if (q_strcasecmp(ext, "dem") == 0) {
+      if (!game[0]) {
+        Con_SafePrintf("Demo \"%s\" not in a mod dir, ignoring.\n", printpath);
+        return false;
+      }
+      Cbuf_AddText(va("playdemo \"%s\"\n", qpath));
+      return true;
+    }
+
+    break;
+  }
+
+  default:
+    break;
+  }
+
+  if (!game[0])
+    Con_SafePrintf("File \"%s\" not in a mod dir, ignoring.\n", printpath);
+  else
+    Con_SafePrintf("Unsupported file type \"%s\", ignoring.\n", printpath);
+
+  return false;
+}
+
+/*
+=================
+COM_InitBaseDir
+=================
+*/
+static void COM_InitBaseDir(void) {
+  char path[MAX_OSPATH];
+  char original[MAX_OSPATH] = {0};
+  char remastered[MAX_OSPATH] = {0};
+  int i, steam, gog, egs;
+
+  // command-line basedir takes priority over everything else
+  i = COM_CheckParm("-basedir");
+  if (i) {
+    const char *dir;
+    if (i >= com_argc - 1)
+      Sys_Error("Please specify a valid Quake directory after -basedir\n"
+                "(one that has an " GAMENAME
+                " subdirectory containing pak0.pak)\n");
+
+    dir = com_argv[++i];
+    if (!COM_SetBaseDir(dir))
+      Sys_Error("The specified -basedir is not a valid Quake directory:\n"
+                "%s\n"
+                "doesn't have an " GAMENAME
+                " subdirectory containing pak0.pak.\n",
+                dir);
+
+    for (;;) // add all other -basedirs
+    {
+      i = COM_CheckParmNext(i, "-basedir");
+      if (!i)
+        break;
+      if (i >= com_argc - 1)
+        Sys_Error("Please specify a directory after -basedir\n");
+      COM_AddBaseDir(com_argv[++i]);
+    }
+
+    return;
+  }
+
+  if (COM_SetBaseDir(host_parms->basedir))
+    return;
+
+  // executable might be in its own subdirectory, try going up one level
+  q_snprintf(path, sizeof(path), "%s/..", host_parms->basedir);
+  if (COM_SetBaseDir(path))
+    return;
+
+  // on Linux, game data might actually be in the user dir
+  if (host_parms->userdir && host_parms->userdir != host_parms->basedir &&
+      COM_SetBaseDir(host_parms->userdir)) {
+    host_parms->basedir = host_parms->userdir;
+    return;
+  }
+
+  Sys_Error("Couldn't determine where Quake is installed.\n"
+            "Please use the -basedir option to specify a path\n"
+            "(with an " GAMENAME " subdirectory containing pak0.pak)");
 }
 
 /*
@@ -2110,68 +2747,80 @@ COM_InitFilesystem
 */
 void COM_InitFilesystem(void) // johnfitz -- modified based on topaz's tutorial
 {
-  int i, j;
+  int i;
+  const char *p, *startarg;
 
   Cvar_RegisterVariable(&registered);
   Cvar_RegisterVariable(&cmdline);
   Cmd_AddCommand("path", COM_Path_f);
   Cmd_AddCommand("game", COM_Game_f); // johnfitz
 
-  i = COM_CheckParm("-basedir");
-  if (i && i < com_argc - 1)
-    q_strlcpy(com_basedir, com_argv[i + 1], sizeof(com_basedir));
-  else
-    q_strlcpy(com_basedir, host_parms->basedir, sizeof(com_basedir));
+  startarg = (com_argc == 2 && Sys_FileType(com_argv[1]) != FS_ENT_NONE)
+                 ? com_argv[1]
+                 : NULL;
 
-  j = strlen(com_basedir);
-  if (j < 1)
-    Sys_Error("Bad argument to -basedir");
-  if ((com_basedir[j - 1] == '\\') || (com_basedir[j - 1] == '/'))
-    com_basedir[j - 1] = 0;
+  if (!startarg || !COM_SetBaseDirRec(startarg))
+    COM_InitBaseDir();
 
-  // start up with GAMENAME by default (id1)
-  COM_AddGameDirectory(com_basedir, GAMENAME);
+  if (host_parms->userdir != host_parms->basedir)
+    COM_AddBaseDir(host_parms->userdir);
+
+  if (startarg)
+    COM_PatchCmdLine(startarg);
+
+  i = COM_CheckParm("-basegame");
+  if (i) { //-basegame:
+    // a) replaces all hardcoded dirs (read: alternative to id1)
+    // b) isn't flushed on normal gamedir switches (like id1).
+    com_modified = true; // shouldn't be relevant when not using id content...
+                         // but we don't really know.
+    for (;; i = COM_CheckParmNext(i, "-basegame")) {
+      if (!i || i >= com_argc - 1)
+        break;
+
+      p = com_argv[i + 1];
+      if (!*p || !strcmp(p, ".") || strstr(p, "..") || strstr(p, "/") ||
+          strstr(p, "\\") || strstr(p, ":"))
+        Sys_Error("gamedir should be a single directory name, not a path\n");
+      if (p != NULL)
+        COM_AddGameDirectory(p);
+    }
+  } else {
+    // start up with GAMENAME by default (id1)
+    COM_AddGameDirectory(GAMENAME);
+  }
 
   /* this is the end of our base searchpath:
    * any set gamedirs, such as those from -game command line
    * arguments or by the 'game' console command will be freed
    * up to here upon a new game command. */
   com_base_searchpaths = com_searchpaths;
+  COM_ResetGameDirectories("");
+
+  Modlist_Init();
 
   // add mission pack requests (only one should be specified)
   if (COM_CheckParm("-rogue"))
-    COM_AddGameDirectory(com_basedir, "rogue");
+    COM_AddGameDirectory("rogue");
   if (COM_CheckParm("-hipnotic"))
-    COM_AddGameDirectory(com_basedir, "hipnotic");
+    COM_AddGameDirectory("hipnotic");
   if (COM_CheckParm("-quoth"))
-    COM_AddGameDirectory(com_basedir, "quoth");
+    COM_AddGameDirectory("quoth");
 
-  i = COM_CheckParm("-game");
-  if (i && i < com_argc - 1) {
-    const char *p = com_argv[i + 1];
+  for (i = 0;;) {
+    i = COM_CheckParmNext(i, "-game");
+    if (!i || i >= com_argc - 1)
+      break;
+
+    p = com_argv[i + 1];
     if (!*p || !strcmp(p, ".") || strstr(p, "..") || strstr(p, "/") ||
         strstr(p, "\\") || strstr(p, ":"))
       Sys_Error("gamedir should be a single directory name, not a path\n");
+    if (!COM_GameDirExists(p))
+      Sys_Error("No such game directory \"%s\"", p);
     com_modified = true;
-    // don't load mission packs twice
-    if (COM_CheckParm("-rogue") && !q_strcasecmp(p, "rogue"))
-      p = NULL;
-    if (p && COM_CheckParm("-hipnotic") && !q_strcasecmp(p, "hipnotic"))
-      p = NULL;
-    if (p && COM_CheckParm("-quoth") && !q_strcasecmp(p, "quoth"))
-      p = NULL;
-    if (p != NULL) {
-      COM_AddGameDirectory(com_basedir, p);
-      // QuakeSpasm extension: treat '-game missionpack' as '-missionpack'
-      if (!q_strcasecmp(p, "rogue")) {
-        rogue = true;
-        standard_quake = false;
-      }
-      if (!q_strcasecmp(p, "hipnotic") || !q_strcasecmp(p, "quoth")) {
-        hipnotic = true;
-        standard_quake = false;
-      }
-    }
+    if (p != NULL)
+      COM_AddGameDirectory(p);
   }
 
   COM_CheckRegistered();
@@ -2372,39 +3021,37 @@ unsigned COM_HashString(const char *str) {
   return hash;
 }
 
+/*
+================
+COM_HashBlock
+Computes the FNV-1a hash of a memory block
+================
+*/
+unsigned COM_HashBlock(const void *data, size_t size) {
+  const byte *ptr = (const byte *)data;
+  unsigned hash = 0x811c9dc5u;
+  while (size--) {
+    hash ^= *ptr++;
+    hash *= 0x01000193u;
+  }
+  return hash;
+}
+
 static size_t mz_zip_file_read_func(void *opaque, mz_uint64 ofs, void *buf,
                                     size_t n) {
   if (SDL_RWseek((SDL_RWops *)opaque, (Sint64)ofs, RW_SEEK_SET) < 0)
     return 0;
-#ifdef USE_SDL2
   return SDL_RWread((SDL_RWops *)opaque, buf, 1, n);
-#else
-  else {
-    int r = SDL_RWread((SDL_RWops *)opaque, buf, 1, n);
-    return (r < 0) ? 0 : r;
-  }
-#endif
 }
-
-#ifndef USE_SDL2 /* no SDL_RWsize in SDL-1.2 */
-static Sint32 SDLCALL SDL_RWsize(SDL_RWops *rw) {
-  Sint32 pos, size;
-  if ((pos = SDL_RWtell(rw)) < 0)
-    return -1;
-  size = SDL_RWseek(rw, 0, RW_SEEK_END);
-  SDL_RWseek(rw, pos, RW_SEEK_SET);
-  return size;
-}
-#endif
 
 /*
 ================
 LOC_LoadFile
 ================
 */
-void LOC_LoadFile(const char *file) {
+qboolean LOC_LoadFile(const char *file) {
   char path[1024];
-  int i, lineno;
+  int i, lineno, warnings;
   char *cursor;
 
   SDL_RWops *rw = NULL;
@@ -2421,28 +3068,23 @@ void LOC_LoadFile(const char *file) {
   localization.numindices = 0;
 
   if (!file || !*file)
-    return;
-
-  Con_Printf("\nLanguage initialization\n");
+    return false;
 
   memset(&archive, 0, sizeof(archive));
-  q_snprintf(path, sizeof(path), "%s/%s", com_basedir, file);
-  rw = SDL_RWFromFile(path, "rb");
-#if defined(DO_USERDIRS)
-  if (!rw) {
-    q_snprintf(path, sizeof(path), "%s/%s", host_parms->userdir, file);
+  for (i = com_numbasedirs - 1; i >= 0; i--) {
+    q_snprintf(path, sizeof(path), "%s/%s", com_basedirs[i], file);
     rw = SDL_RWFromFile(path, "rb");
+    if (rw)
+      break;
   }
-#endif
   if (!rw) {
-    q_snprintf(path, sizeof(path), "%s/QuakeEX.kpf", com_basedir);
-    rw = SDL_RWFromFile(path, "rb");
-#if defined(DO_USERDIRS)
-    if (!rw) {
-      q_snprintf(path, sizeof(path), "%s/QuakeEX.kpf", host_parms->userdir);
+    for (i = com_numbasedirs - 1; i >= 0; i--) {
+      q_snprintf(path, sizeof(path), "%s/QuakeEX.kpf", com_basedirs[i]);
       rw = SDL_RWFromFile(path, "rb");
+      if (rw)
+        break;
     }
-#endif
+
     if (!rw)
       goto fail;
     sz = SDL_RWsize(rw);
@@ -2470,8 +3112,8 @@ void LOC_LoadFile(const char *file) {
       mz_zip_reader_end(&archive);
       if (rw)
         SDL_RWclose(rw);
-      Con_Printf("Couldn't load '%s'\nfrom '%s'\n", file, com_basedir);
-      return;
+      Con_Printf("Couldn't load '%s'\n", file);
+      return false;
     }
     SDL_RWread(rw, localization.text, 1, sz);
     SDL_RWclose(rw);
@@ -2484,6 +3126,7 @@ void LOC_LoadFile(const char *file) {
       (unsigned char)(cursor[1]) == 0xBB && (unsigned char)(cursor[2]) == 0xBF)
     cursor += 3;
 
+  warnings = 0;
   lineno = 0;
   while (*cursor) {
     char *line, *equals;
@@ -2594,6 +3237,21 @@ void LOC_LoadFile(const char *file) {
             sizeof(*localization.entries) * localization.maxnumentries);
       }
 
+      UTF8_ToQuake(value, strlen(value) + 1, value);
+
+      // Log entries with unprintable characters if developer is set to 2 or
+      // higher
+      if (developer.value >= 2.f && strchr(value, QCHAR_BOX)) {
+        int trim = (int)strlen(value);
+        // trim trailing newlines
+        while (trim > 0 && value[trim - 1] == '\n')
+          --trim;
+        // print header before first entry
+        if (!warnings++)
+          Sys_Printf("Entries with unprintable characters:\n");
+        Sys_Printf("   %d. %s = \"%.*s\"\n", warnings, line, trim, value);
+      }
+
       entry = &localization.entries[localization.numentries++];
       entry->key = line;
       entry->value = value;
@@ -2603,12 +3261,15 @@ void LOC_LoadFile(const char *file) {
       *cursor++ = 0; // terminate line and advance to next
   }
 
+  if (developer.value >= 2.f && warnings > 0)
+    Sys_Printf("%d strings with unprintable characters\n", warnings);
+
   // hash all entries
 
   localization.numindices = localization.numentries * 2; // 50% load factor
   if (localization.numindices == 0) {
     Con_Printf("No localized strings in file '%s'\n", file);
-    return;
+    return false;
   }
 
   localization.indices = (unsigned *)realloc(localization.indices,
@@ -2637,7 +3298,86 @@ void LOC_LoadFile(const char *file) {
     }
   }
 
-  Con_Printf("Loaded %d strings from '%s'\n", localization.numentries, file);
+  Con_SafePrintf("[skipnotify]Loaded %d strings from '%s'\n",
+                 localization.numentries, file);
+
+  return true;
+}
+
+static const char *const knownlangs[][2] = {
+    {"", "auto"},     {"en", "english"}, {"fr", "french"},
+    {"de", "german"}, {"it", "italian"}, {"es", "spanish"},
+};
+
+// Different from language cvar if language is "auto"
+static const char *userlang = "english";
+
+/*
+================
+LOC_Load
+================
+*/
+void LOC_Load(void) {
+  if (!LOC_LoadFile(va("localization/loc_%s.txt", userlang)))
+    LOC_LoadFile("localization/loc_english.txt");
+}
+
+/*
+================
+LOC_GetSystemLanguage
+================
+*/
+const char *LOC_GetSystemLanguage(void) {
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+  size_t i, j;
+  SDL_Locale *prefs = SDL_GetPreferredLocales();
+
+  if (!prefs)
+    return "english";
+
+  for (i = 0; prefs[i].language; i++) {
+    for (j = 1; j < countof(knownlangs); j++) // start at 1, skipping "auto"
+    {
+      if (!q_strcasecmp(prefs[i].language, knownlangs[j][0])) {
+        SDL_free(prefs);
+        return knownlangs[j][1];
+      }
+    }
+  }
+
+  SDL_free(prefs);
+#else
+#pragma message(                                                               \
+    "Warning: automatic language detection disabled (needs SDL >= 2.0.14)")
+#endif
+  return "english";
+}
+
+/*
+================
+LOC_Language_f
+
+Called when language changes
+================
+*/
+void LOC_Language_f(cvar_t *cvar) {
+  if (!q_strcasecmp(cvar->string, "auto"))
+    userlang = LOC_GetSystemLanguage();
+  else
+    userlang = cvar->string;
+  LOC_Load();
+}
+
+/*
+================
+LOC_LanguageCompletion_f
+================
+*/
+void LOC_LanguageCompletion_f(cvar_t *cvar, const char *partial) {
+  size_t i;
+
+  for (i = 0; i < countof(knownlangs); i++)
+    Con_AddToTabList(knownlangs[i][1], partial, NULL);
 }
 
 /*
@@ -2645,7 +3385,14 @@ void LOC_LoadFile(const char *file) {
 LOC_Init
 ================
 */
-void LOC_Init(void) { LOC_LoadFile("localization/loc_english.txt"); }
+void LOC_Init(void) {
+  Con_Printf("\nLanguage initialization\n");
+
+  Cvar_RegisterVariable(&language);
+  Cvar_SetCallback(&language, LOC_Language_f);
+  Cvar_SetCompletion(&language, LOC_LanguageCompletion_f);
+  language.callback(&language);
+}
 
 /*
 ================
@@ -2804,4 +3551,322 @@ size_t LOC_Format(const char *format,
   out[written] = 0;
 
   return written;
+}
+
+/*
+============================================================================
+                                                                UNICODE
+============================================================================
+*/
+
+static const uint32_t utf8_maxcode[4] = {0x7F, 0x7FF, 0xFFFF,
+                                         0x10FFFF}; // 1/2/3/4 bytes
+
+static char unicode_translit[65536][2];
+static qboolean unicode_translit_init = false;
+
+static const uint32_t qchar_to_unicode[256] =
+{/*     0       1       2       3       4       5       6       7       8       9       10      11      12      13      14      15
+      ----------------------------------------------------------------------------------------------------------------------------------
+  0 */  0x00B7, 0,      0,      0,      0,      0x00B7, 0,      0,      0,      0,      '\n',   0x25A0, ' ',    0x25B6, 0x00B7, 0x00B7, /*
+  1 */  0x301A, 0x301B, '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',    '8',    '9',    0x00B7, '-',    '-',    '-',    /*
+  2 */  ' ',    '!',    '"',    '#',    '$',    '%',    '&',    '\'',   '(',    ')',    '*',    '+',    ',',    '-',    '.',    '/',    /*
+  3 */  '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',    '8',    '9',    ':',    ';',    '<',    '=',    '>',    '?',    /*
+  4 */  '@',    'A',    'B',    'C',    'D',    'E',    'F',    'G',    'H',    'I',    'J',    'K',    'L',    'M',    'N',    'O',    /*
+  5 */  'P',    'Q',    'R',    'S',    'T',    'U',    'V',    'W',    'X',    'Y',    'Z',    '[',    '\\',   ']',    '^',    '_',    /*
+  6 */  '`',    'a',    'b',    'c',    'd',    'e',    'f',    'g',    'h',    'i',    'j',    'k',    'l',    'm',    'n',    'o',    /*
+  7 */  'p',    'q',    'r',    's',    't',    'u',    'v',    'w',    'x',    'y',    'z',    '{',    '|',    '}',    '~',    0x2190, /*
+
+  8 */  '-',    '-',    '-',    '-',    0,      0x2022, 0,      0,      0,      0,      '\n',   0x25A0, ' ',    0x25B6, 0x2022, 0x2022, /*
+  9 */  0x301A, 0x301B, '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',    '8',    '9',    0x2022, '-',    '-',    '-',    /*
+ 10 */  ' ',    '!',    '"',    '#',    '$',    '%',    '&',    '\'',   '(',    ')',    '*',    '+',    ',',    '-',    '.',    '/',    /*
+ 11 */  '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',    '8',    '9',    ':',    ';',    '<',    '=',    '>',    '?',    /*
+ 12 */  '@',    'A',    'B',    'C',    'D',    'E',    'F',    'G',    'H',    'I',    'J',    'K',    'L',    'M',    'N',    'O',    /*
+ 13 */  'P',    'Q',    'R',    'S',    'T',    'U',    'V',    'W',    'X',    'Y',    'Z',    '[',    '\\',   ']',    '^',    '_',    /*
+ 14 */  '`',    'a',    'b',    'c',    'd',    'e',    'f',    'g',    'h',    'i',    'j',    'k',    'l',    'm',    'n',    'o',    /*
+ 15 */  'p',    'q',    'r',    's',    't',    'u',    'v',    'w',    'x',    'y',    'z',    '{',    '|',    '}',    '~',    0x2190, /*
+      ----------------------------------------------------------------------------------------------------------------------------------
+*/};
+
+/*
+==================
+UTF8_CodePointLength
+
+Returns the number of bytes needed to encode the codepoint
+using UTF-8 (max 4), or 0 for an invalid code point
+==================
+*/
+size_t UTF8_CodePointLength(uint32_t codepoint) {
+  if (codepoint < 0x80)
+    return 1;
+
+  if (codepoint < 0x800)
+    return 2;
+
+  if (codepoint < 0x10000)
+    return 3;
+
+  if (codepoint < 0x110000)
+    return 4;
+
+  return 0;
+}
+
+/*
+==================
+UTF8_WriteCodePoint
+
+Writes a single Unicode code point using UTF-8
+
+Returns the number of bytes written (up to 4),
+or 0 on error (overflow or invalid code point)
+==================
+*/
+size_t UTF8_WriteCodePoint(char *dst, size_t maxbytes, uint32_t codepoint) {
+  if (!maxbytes)
+    return 0;
+
+  if (codepoint < 0x80) {
+    dst[0] = (char)codepoint;
+    return 1;
+  }
+
+  if (codepoint < 0x800) {
+    if (maxbytes < 2)
+      return 0;
+    dst[0] = 0xC0 | (codepoint >> 6);
+    dst[1] = 0x80 | (codepoint & 63);
+    return 2;
+  }
+
+  if (codepoint < 0x10000) {
+    if (maxbytes < 3)
+      return 0;
+    dst[0] = 0xE0 | (codepoint >> 12);
+    dst[1] = 0x80 | ((codepoint >> 6) & 63);
+    dst[2] = 0x80 | (codepoint & 63);
+    return 3;
+  }
+
+  if (codepoint < 0x110000) {
+    if (maxbytes < 4)
+      return 0;
+    dst[0] = 0xF0 | (codepoint >> 18);
+    dst[1] = 0x80 | ((codepoint >> 12) & 63);
+    dst[2] = 0x80 | ((codepoint >> 6) & 63);
+    dst[3] = 0x80 | (codepoint & 63);
+    return 4;
+  }
+
+  return 0;
+}
+
+/*
+==================
+UTF8_ReadCodePoint
+
+Reads at most 6 bytes from *src and advances the pointer
+
+Returns 32-bit codepoint, or UNICODE_UNKNOWN on error
+==================
+*/
+uint32_t UTF8_ReadCodePoint(const char **src) {
+  const char *text = *src;
+  uint32_t code, mask, i;
+  uint8_t first, cont;
+
+  first = text[0];
+  if (!first)
+    return 0;
+
+  if (first < 128) {
+    *src = text + 1;
+    return first;
+  }
+
+  if ((first & 0xC0) != 0xC0) {
+    *src = text + 1;
+    return UNICODE_UNKNOWN;
+  }
+
+  mask = first << 1;
+  code = 0;
+  for (i = 1; i < 6 && (mask & 0x80) != 0; i++, mask <<= 1) {
+    cont = text[i];
+    if (!cont) {
+      *src = text + i;
+      return UNICODE_UNKNOWN;
+    }
+    if ((cont & 0x80) != 0x80) {
+      *src = text + i + 1;
+      return UNICODE_UNKNOWN;
+    }
+    code = (code << 6) | (cont & 63);
+  }
+
+  mask = ((1 << (7 - i)) - 1);
+  code |= (first & mask) << (6 * (i - 1));
+  *src = text + i;
+
+  if (code > UNICODE_MAX ||         // out of range
+      i > 4 ||                      // out of range/overlong
+      code > utf8_maxcode[i - 1] || // overlong
+      code - 0xD800 < 1024)         // surrogate
+  {
+    code = UNICODE_UNKNOWN;
+  }
+
+  return code;
+}
+
+/*
+==================
+UTF8_FromQuake
+
+Converts a string from Quake encoding to UTF-8
+
+Returns the number of written characters (including the NUL terminator)
+if a valid output buffer is provided (dst is non-NULL, maxbytes > 0),
+or the total amount of space necessary to encode the entire src string
+if dst is NULL and maxbytes is 0.
+==================
+*/
+size_t UTF8_FromQuake(char *dst, size_t maxbytes, const char *src) {
+  size_t i, j, written;
+
+  if (!maxbytes) {
+    if (dst)
+      return 0; // error
+    for (i = 0, j = 0; src[i]; i++) {
+      uint32_t codepoint = qchar_to_unicode[(unsigned char)src[i]];
+      if (codepoint)
+        j += UTF8_CodePointLength(codepoint);
+    }
+    return j + 1; // include terminator
+  }
+
+  --maxbytes;
+
+  for (i = 0, j = 0; j < maxbytes && src[i]; i++) {
+    uint32_t codepoint = qchar_to_unicode[(unsigned char)src[i]];
+    if (!codepoint)
+      continue;
+    written = UTF8_WriteCodePoint(dst + j, maxbytes - j, codepoint);
+    if (!written)
+      break;
+    j += written;
+  }
+
+  dst[j++] = '\0';
+
+  return j;
+}
+
+/*
+==================
+UTF8_ToQuake
+
+Transliterates a string from UTF-8 to Quake encoding
+
+Returns the number of written characters (including the NUL terminator)
+if a valid output buffer is provided (dst is non-NULL, maxbytes > 0),
+or the total amount of space necessary to encode the entire src string
+if dst is NULL and maxbytes is 0.
+
+Note: only single-character and two-character transliterations are used
+so that the string is never expanded during the process.
+==================
+*/
+size_t UTF8_ToQuake(char *dst, size_t maxbytes, const char *src) {
+  size_t i, j;
+  uint32_t cp;
+
+  if (!unicode_translit_init) {
+    // precomputed single-character/two-character transliterations
+    for (i = 0; i < countof(unicode_translit_src); i++) {
+      unicode_translit[unicode_translit_src[i].code][0] =
+          unicode_translit_src[i].remap[0];
+      unicode_translit[unicode_translit_src[i].code][1] =
+          unicode_translit_src[i].remap[1];
+    }
+
+    // Quake-specific characters: we process the list in reverse order
+    // so that codepoints used for both colored and non-colored qchars
+    // end up being remapped to the non-colored versions
+    // Note: 0 is not included
+    for (i = countof(qchar_to_unicode) - 1; i > 0; i--) {
+      if (qchar_to_unicode[i] >= 128 &&
+          qchar_to_unicode[i] < countof(unicode_translit)) {
+        unicode_translit[qchar_to_unicode[i]][0] = (char)i;
+        unicode_translit[qchar_to_unicode[i]][1] = '\0';
+      }
+    }
+
+    // map ASCII characters to themselves
+    for (i = 0; i < 128; i++) {
+      unicode_translit[i][0] = (char)i;
+      unicode_translit[i][1] = '\0';
+    }
+
+    // Map all other characters to QCHAR_BOX (unknown character)
+    for (i = 0; i < Q_COUNTOF(unicode_translit); i++) {
+      if (!unicode_translit[i][0]) {
+        unicode_translit[i][0] = QCHAR_BOX;
+        unicode_translit[i][1] = '\0';
+      }
+    }
+
+    unicode_translit_init = true;
+  }
+
+  if (!maxbytes) {
+    if (dst)
+      return 0; // error
+
+    // Determine necessary output buffer size
+    for (i = 0, j = 0; *src; i++) {
+      // ASCII fast path
+      while (*src && (byte)*src < 0x80) {
+        src++;
+        j++;
+      }
+
+      if (!*src)
+        break;
+
+      // A codepoint maps to either one or two Quake characters
+      cp = UTF8_ReadCodePoint(&src);
+      if (cp < Q_COUNTOF(unicode_translit))
+        j += unicode_translit[cp][1] != '\0' ? 2 : 1;
+      else
+        j++;
+    }
+
+    return j + 1; // include terminator
+  }
+
+  --maxbytes;
+
+  for (i = 0; i < maxbytes && *src; i++) {
+    // ASCII fast path
+    while (*src && i < maxbytes && (byte)*src < 0x80)
+      dst[i++] = *src++;
+
+    if (!*src || i >= maxbytes)
+      break;
+
+    cp = UTF8_ReadCodePoint(&src);
+    if (cp < countof(unicode_translit)) {
+      char c0 = unicode_translit[cp][0];
+      char c1 = unicode_translit[cp][1];
+      dst[i] = c0;
+      if (c1 && i + 1 < maxbytes)
+        dst[++i] = c1;
+    } else
+      dst[i] = QCHAR_BOX;
+  }
+
+  dst[i++] = '\0';
+
+  return i;
 }

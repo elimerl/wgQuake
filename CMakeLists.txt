@@ -9,7 +9,7 @@ project(
 add_subdirectory(webgpu)
 add_subdirectory(sdl2webgpu)
 
-add_executable(wgQuake main.c wgpu_app.h wgpu_app.c wgpu_utils.h wgpu_utils.c)
+add_executable(wgQuake main.c wgpu_app.h wgpu_app.c wgpu_utils.h wgpu_utils.c HandmadeMath.h)
 
 set(SRC "${CMAKE_SOURCE_DIR}")
 set(COMMON_SOURCES
@@ -36,18 +36,21 @@ set(COMMON_SOURCES
 "${SRC}/Quake/gl_rmain.c"
 "${SRC}/Quake/gl_rmisc.c"
 "${SRC}/Quake/gl_screen.c"
+"${SRC}/Quake/gl_shaders.c"
 "${SRC}/Quake/gl_sky.c"
 "${SRC}/Quake/gl_texmgr.c"
 "${SRC}/Quake/gl_vidsdl.c"
 "${SRC}/Quake/gl_warp.c"
-"${SRC}/Quake/host.c"
 "${SRC}/Quake/host_cmd.c"
+"${SRC}/Quake/host.c"
 "${SRC}/Quake/image.c"
 "${SRC}/Quake/in_sdl.c"
+"${SRC}/Quake/json.c"
 "${SRC}/Quake/keys.c"
 "${SRC}/Quake/main_sdl.c"
 "${SRC}/Quake/mathlib.c"
 "${SRC}/Quake/menu.c"
+"${SRC}/Quake/miniz.c"
 "${SRC}/Quake/net_bsd.c"
 "${SRC}/Quake/net_dgrm.c"
 "${SRC}/Quake/net_loop.c"
@@ -85,7 +88,6 @@ set(COMMON_SOURCES
 "${SRC}/Quake/wad.c"
 "${SRC}/Quake/world.c"
 "${SRC}/Quake/zone.c"
-"${SRC}/Quake/miniz.c"
 )
 
 if (WIN32) 
@@ -139,6 +141,8 @@ else()
 	set(SDL_SHARED OFF)
 	add_subdirectory(SDL)
 	find_package(OpenGL REQUIRED)
+	target_compile_options(wgQuake PRIVATE -fsanitize=address)
+	target_link_options(wgQuake PRIVATE -fsanitize=address)
 	target_link_libraries(wgQuake PRIVATE ${COMMON_LIBRARIES} ${PLATFORM_LIBRARIES} ${OPENGL_LIBRARIES} SDL2::SDL2-static)
 endif()
 
@@ -149,3 +153,10 @@ add_custom_command(TARGET wgQuake POST_BUILD COMMAND
 	"${SRC}/Quake/quakespasm.pak"
 	"$<TARGET_FILE_DIR:wgQuake>"
 )
+
+add_custom_command(TARGET wgQuake POST_BUILD COMMAND
+	${CMAKE_COMMAND} -E copy_if_different
+	"${SRC}/Quake/ironwail.pak"
+	"$<TARGET_FILE_DIR:wgQuake>"
+)
+

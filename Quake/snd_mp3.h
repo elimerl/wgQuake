@@ -8,6 +8,7 @@
 extern snd_codec_t mp3_codec;
 int mp3_skiptags(snd_stream_t *);
 
-#endif /* USE_CODEC_MP3 */
+#endif	/* USE_CODEC_MP3 */
 
-#endif /* ! _SND_MP3_H_ */
+#endif	/* ! _SND_MP3_H_ */
+

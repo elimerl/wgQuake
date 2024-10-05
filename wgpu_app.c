@@ -98,8 +98,6 @@ void WG_Destroy() {
 WGPUTextureView WG_NextSurfaceTextureView() {
   WGPUSurfaceTexture surfaceTexture;
 
-  printf("%p %p\n", app.surface, &surfaceTexture);
-
   wgpuSurfaceGetCurrentTexture(app.surface, &surfaceTexture);
   if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_Success) {
     return NULL;

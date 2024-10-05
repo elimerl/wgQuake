@@ -3,6 +3,7 @@ Copyright (C) 1996-2001 Id Software, Inc.
 Copyright (C) 2002-2009 John Fitzgibbons and others
 Copyright (C) 2007-2008 Kristian Duske
 Copyright (C) 2010-2014 QuakeSpasm developers
+Copyright (C) 2016      Spike
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -58,20 +59,20 @@ const char *svc_strings[] = {
     "svc_cdtrack", // [byte] track [byte] looptrack
     "svc_sellscreen", "svc_cutscene",
     // johnfitz -- new server messages
-    "",                   // 35
-    "",                   // 36
-    "svc_skybox",         // 37					// [string] skyname
-    "svc_botchat",        // 38 (2021 RE-RELEASE)
-    "",                   // 39
-    "svc_bf",             // 40						// no data
-    "svc_fog",            // 41					// [byte] density [byte]
-                          // red [byte] green [byte] blue [float] time
-    "svc_spawnbaseline2", // 42			// support for large modelindex,
-                          // large framenum, alpha, using flags
+    "",                      // 35
+    "",                      // 36
+    "svc_skybox",            // 37					// [string] skyname
+    "svc_botchat",           // 38 (2021 RE-RELEASE)
+    "",                      // 39
+    "svc_bf",                // 40						// no data
+    "svc_fog",               // 41					// [byte] density [byte]
+                             // red [byte] green [byte] blue [float] time
+    "svc_spawnbaseline2",    // 42			// support for large modelindex,
+                             // large framenum, alpha, using flags
     "svc_spawnstatic2",      // 43			// support for large modelindex,
                              // large framenum, alpha, using flags
     "svc_spawnstaticsound2", //	44		// [coord3] [short] samp [byte]
-                             //vol [byte] aten
+                             // vol [byte] aten
                              // johnfitz
 
     // 2021 RE-RELEASE:
@@ -348,7 +349,10 @@ void CL_ParseServerInfo(void) {
   }
 
   // johnfitz -- check for excessive models
-  if (nummodels >= 256)
+  if (nummodels >= 2048)
+    Con_Warning("%i models exceeds QS limit of 2048 (max = %d).\n", nummodels,
+                MAX_MODELS);
+  else if (nummodels >= 256)
     Con_DWarning("%i models exceeds standard limit of 256 (max = %d).\n",
                  nummodels, MAX_MODELS);
   // johnfitz
@@ -435,6 +439,7 @@ void CL_ParseUpdate(int bits) {
   entity_t *ent;
   int num;
   int skin;
+  int prevframe;
 
   if (cls.signon == SIGNONS - 1) { // first update is the final signon stage
     cls.signon = SIGNONS;
@@ -484,6 +489,7 @@ void CL_ParseUpdate(int bits) {
   } else
     modnum = ent->baseline.modelindex;
 
+  prevframe = ent->frame;
   if (bits & U_FRAME)
     ent->frame = MSG_ReadByte();
   else
@@ -601,7 +607,9 @@ void CL_ParseUpdate(int bits) {
     // automatic animation (torches, etc) can be either all together
     // or randomized
     if (model) {
-      if (model->synctype == ST_RAND)
+      if (model->synctype == ST_FRAMETIME)
+        ent->syncbase = -cl.time;
+      else if (model->synctype == ST_RAND)
         ent->syncbase = (float)(rand() & 0x7fff) / 0x7fff;
       else
         ent->syncbase = 0.0;
@@ -615,6 +623,8 @@ void CL_ParseUpdate(int bits) {
         LERP_RESETANIM; // johnfitz -- don't lerp animation across model changes
   }
   // johnfitz
+  else if (model && model->synctype == ST_FRAMETIME && ent->frame != prevframe)
+    ent->syncbase = -cl.time;
 
   if (forcelink) { // didn't have an update last message
     VectorCopy(ent->msg_origins[0], ent->msg_origins[1]);
@@ -656,6 +666,8 @@ void CL_ParseBaseline(entity_t *ent, int version) // johnfitz -- added argument
   ent->baseline.scale = (bits & B_SCALE) ? MSG_ReadByte() : ENTSCALE_DEFAULT;
 }
 
+#define CL_SetHudStat(stat) cl.statsf[stat] = cl.stats[stat]
+
 /*
 ==================
 CL_ParseClientdata
@@ -687,6 +699,10 @@ void CL_ParseClientdata(void) {
   else
     cl.idealpitch = 0;
 
+  // preserve initial angles (mostly for savegames)
+  if (cls.signon < SIGNONS)
+    V_StopPitchDrift();
+
   VectorCopy(cl.mvelocity[0], cl.mvelocity[1]);
   for (i = 0; i < 3; i++) {
     if (bits & (SU_PUNCH1 << i))
@@ -706,6 +722,7 @@ void CL_ParseClientdata(void) {
       v_punchangles[0][2] != cl.punchangle[2]) {
     VectorCopy(v_punchangles[0], v_punchangles[1]);
     VectorCopy(cl.punchangle, v_punchangles[0]);
+    cl.punchtime = cl.time;
   }
   // johnfitz
 
@@ -718,6 +735,7 @@ void CL_ParseClientdata(void) {
       if ((i & (1 << j)) && !(cl.items & (1 << j)))
         cl.item_gettime[j] = cl.time;
     cl.items = i;
+    cl.stats[STAT_ITEMS] = i;
   }
 
   cl.onground = (bits & SU_ONGROUND) != 0;
@@ -802,6 +820,17 @@ void CL_ParseClientdata(void) {
   else
     cl.viewent.alpha = ENTALPHA_DEFAULT;
   // johnfitz
+
+  CL_SetHudStat(STAT_WEAPONFRAME);
+  CL_SetHudStat(STAT_ARMOR);
+  CL_SetHudStat(STAT_WEAPON);
+  CL_SetHudStat(STAT_ACTIVEWEAPON);
+  CL_SetHudStat(STAT_HEALTH);
+  CL_SetHudStat(STAT_AMMO);
+  CL_SetHudStat(STAT_SHELLS);
+  CL_SetHudStat(STAT_NAILS);
+  CL_SetHudStat(STAT_ROCKETS);
+  CL_SetHudStat(STAT_CELLS);
 
   // johnfitz -- lerping
   // ericw -- this was done before the upper 8 bits of cl.stats[STAT_WEAPON]
@@ -949,6 +978,44 @@ static void CL_DumpPacket (void)
   if (cl_shownet.value == 2)                                                   \
     Con_Printf("%3i:%s\n", msg_readcount - 1, x);
 
+// mods and servers might not send the \n instantly.
+// some mods bug out and omit the \n entirely, this function helps prevent the
+// damage from spreading too much. some servers or mods use //prefixed commands
+// as extensions to avoid spam about unrecognised commands. proquake has its own
+// extension coding thing.
+static void CL_ParseStuffText(const char *msg) {
+  const char *str;
+  q_strlcat(cl.stuffcmdbuf, msg, sizeof(cl.stuffcmdbuf));
+  for (; (str = strchr(cl.stuffcmdbuf, '\n'));
+       memmove(cl.stuffcmdbuf, str, Q_strlen(str) + 1)) {
+    qboolean handled = false;
+
+    str++; // skip past the \n
+
+    if (*cl.stuffcmdbuf == 0x01 &&
+        cl.protocol == PROTOCOL_NETQUAKE) // proquake message, just strip this
+                                          // and try again (doesn't necessarily
+                                          // have a trailing \n straight away)
+    {
+      for (str = cl.stuffcmdbuf + 1; *str >= 0x01 && *str <= 0x1f; str++)
+        ; // FIXME: parse properly
+      continue;
+    }
+
+    // handle special commands
+    if (cl.stuffcmdbuf[0] == '/' && cl.stuffcmdbuf[1] == '/') {
+      handled = Cmd_ExecuteString(cl.stuffcmdbuf + 2, src_server);
+      if (!handled)
+        Con_DPrintf("Server sent unknown command %s\n", Cmd_Argv(0));
+    } else
+      handled = Cmd_ExecuteString(cl.stuffcmdbuf, src_server);
+
+    // let the server exec general user commands (massive security hole)
+    if (!handled)
+      Cbuf_AddTextLen(cl.stuffcmdbuf, str - cl.stuffcmdbuf);
+  }
+}
+
 /*
 =====================
 CL_ParseServerMessage
@@ -957,8 +1024,8 @@ CL_ParseServerMessage
 void CL_ParseServerMessage(void) {
   int cmd;
   int i;
-  const char *str;       // johnfitz
-  int total, j, lastcmd; // johnfitz
+  const char *str; // johnfitz
+  int lastcmd;     // johnfitz
 
   //
   // if recording demos, copy the message out
@@ -984,6 +1051,15 @@ void CL_ParseServerMessage(void) {
 
     if (cmd == -1) {
       SHOWNET("END OF MESSAGE");
+
+      if (*cl.stuffcmdbuf && net_message.cursize < 512)
+        CL_ParseStuffText(
+            "\n"); // there's a few mods that forget to write \ns, that then
+                   // fuck up other things too. So make sure it gets flushed to
+                   // the cbuf. the cursize check is to reduce backbuffer
+                   // overflows that would give a false positive.
+
+      CL_FinishDemoFrame();
       return; // end of message
     }
 
@@ -1015,6 +1091,7 @@ void CL_ParseServerMessage(void) {
     case svc_time:
       cl.mtime[1] = cl.mtime[0];
       cl.mtime[0] = MSG_ReadFloat();
+      cl.fixangle = false;
       break;
 
     case svc_clientdata:
@@ -1049,7 +1126,7 @@ void CL_ParseServerMessage(void) {
       break;
 
     case svc_stufftext:
-      Cbuf_AddText(MSG_ReadString());
+      CL_ParseStuffText(MSG_ReadString());
       break;
 
     case svc_damage:
@@ -1064,6 +1141,7 @@ void CL_ParseServerMessage(void) {
     case svc_setangle:
       for (i = 0; i < 3; i++)
         cl.viewangles[i] = MSG_ReadAngle(cl.protocolflags);
+      cl.fixangle = true;
       break;
 
     case svc_setview:
@@ -1074,21 +1152,7 @@ void CL_ParseServerMessage(void) {
       i = MSG_ReadByte();
       if (i >= MAX_LIGHTSTYLES)
         Sys_Error("svc_lightstyle > MAX_LIGHTSTYLES");
-      q_strlcpy(cl_lightstyle[i].map, MSG_ReadString(), MAX_STYLESTRING);
-      cl_lightstyle[i].length = Q_strlen(cl_lightstyle[i].map);
-      // johnfitz -- save extra info
-      if (cl_lightstyle[i].length) {
-        total = 0;
-        cl_lightstyle[i].peak = 'a';
-        for (j = 0; j < cl_lightstyle[i].length; j++) {
-          total += cl_lightstyle[i].map[j] - 'a';
-          cl_lightstyle[i].peak =
-              q_max(cl_lightstyle[i].peak, cl_lightstyle[i].map[j]);
-        }
-        cl_lightstyle[i].average = total / cl_lightstyle[i].length + 'a';
-      } else
-        cl_lightstyle[i].average = cl_lightstyle[i].peak = 'm';
-      // johnfitz
+      CL_SetLightstyle(i, MSG_ReadString());
       break;
 
     case svc_sound:
@@ -1175,10 +1239,12 @@ void CL_ParseServerMessage(void) {
 
     case svc_killedmonster:
       cl.stats[STAT_MONSTERS]++;
+      cl.statsf[STAT_MONSTERS] = cl.stats[STAT_MONSTERS];
       break;
 
     case svc_foundsecret:
       cl.stats[STAT_SECRETS]++;
+      cl.statsf[STAT_SECRETS] = cl.stats[STAT_SECRETS];
       break;
 
     case svc_updatestat:
@@ -1186,7 +1252,7 @@ void CL_ParseServerMessage(void) {
       if (i < 0 || i >= MAX_CL_STATS)
         Sys_Error("svc_updatestat: %i is invalid", i);
       cl.stats[i] = MSG_ReadLong();
-      ;
+      cl.statsf[i] = cl.stats[i];
       break;
 
     case svc_spawnstaticsound:
@@ -1268,7 +1334,8 @@ void CL_ParseServerMessage(void) {
     // used by the 2021 rerelease
     case svc_achievement:
       str = MSG_ReadString();
-      Con_DPrintf("Ignoring svc_achievement (%s)\n", str);
+      if (cls.demoplayback)
+        Con_DPrintf("Ignoring svc_achievement (%s)\n", str);
       break;
     case svc_localsound:
       CL_ParseLocalSound();

@@ -1,0 +1,2 @@
+r_lerpmodels 1
+r_lerpmove 1

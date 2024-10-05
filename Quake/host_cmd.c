@@ -22,12 +22,16 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "quakedef.h"
-#ifndef _WIN32
-#include <dirent.h>
-#endif
+#include "q_ctype.h"
+#include "json.h"
+#include <time.h>
+#define MAX_URL 2048
 
 extern cvar_t pausable;
 extern cvar_t nomonsters;
+
+// 0 = no, 1 = ask, 2 = when dead, 3 = always
+cvar_t sv_autoload = {"sv_autoload", "2", CVAR_ARCHIVE};
 
 int current_skill;
 
@@ -53,24 +57,36 @@ void Host_Quit_f(void) {
 
 /*
 ==================
-FileList_Add
+FileList_AddWithData
 ==================
 */
-static void FileList_Add(const char *name, filelist_item_t **list) {
+static filelist_item_t *FileList_AddWithData(const char *name, const void *data,
+                                             size_t datasize,
+                                             filelist_item_t **list) {
   filelist_item_t *item, *cursor, *prev;
 
   // ignore duplicate
   for (item = *list; item; item = item->next) {
     if (!Q_strcmp(name, item->name))
-      return;
+      return item;
   }
 
-  item = (filelist_item_t *)Z_Malloc(sizeof(filelist_item_t));
+  item = (filelist_item_t *)malloc(sizeof(filelist_item_t) + datasize);
+  if (!item)
+    Sys_Error("FileList_AddWithData: out of memory on %" SDL_PRIu64
+              " bytes (%s)",
+              (uint64_t)(sizeof(filelist_item_t) + datasize), name);
   q_strlcpy(item->name, name, sizeof(item->name));
+  if (datasize) {
+    if (data)
+      memcpy(item + 1, data, datasize);
+    else
+      memset(item + 1, 0, datasize);
+  }
 
   // insert each entry in alphabetical order
   if (*list == NULL ||
-      q_strcasecmp(item->name, (*list)->name) < 0) // insert at front
+      q_strnaturalcmp(item->name, (*list)->name) < 0) // insert at front
   {
     item->next = *list;
     *list = item;
@@ -78,40 +94,323 @@ static void FileList_Add(const char *name, filelist_item_t **list) {
   {
     prev = *list;
     cursor = (*list)->next;
-    while (cursor && (q_strcasecmp(item->name, cursor->name) > 0)) {
+    while (cursor && (q_strnaturalcmp(item->name, cursor->name) > 0)) {
       prev = cursor;
       cursor = cursor->next;
     }
     item->next = prev->next;
     prev->next = item;
   }
+
+  return item;
 }
 
+/*
+==================
+FileList_Add
+==================
+*/
+static void FileList_Add(const char *name, filelist_item_t **list) {
+  FileList_AddWithData(name, NULL, 0, list);
+}
+
+/*
+==================
+FileList_Clear
+==================
+*/
 static void FileList_Clear(filelist_item_t **list) {
   filelist_item_t *blah;
 
   while (*list) {
     blah = (*list)->next;
-    Z_Free(*list);
+    free(*list);
     *list = blah;
   }
 }
 
-filelist_item_t *extralevels;
+/*
+==================
+RightPad
+==================
+*/
+static const char *RightPad(const char *str, size_t minlen, char c) {
+  static char buf[1024];
+  size_t len = strlen(str);
 
-static void ExtraMaps_Add(const char *name) {
-  FileList_Add(name, &extralevels);
+  minlen = q_min(minlen, sizeof(buf) - 1);
+  if (len >= minlen)
+    return str;
+
+  memcpy(buf, str, len);
+  for (; len < minlen; len++)
+    buf[len] = c;
+  buf[len] = '\0';
+
+  return buf;
 }
 
+filelist_item_t *extralevels;
+filelist_item_t **extralevels_sorted;
+size_t maxlevelnamelen;
+
+static SDL_Thread *extralevels_parsing_thread;
+static SDL_atomic_t extralevels_cancel_parsing;
+
+/*
+==================
+FileList_Print
+
+Prints all items in list (containing substr, if any)
+Note: types array contains singular/plural forms for the list type
+==================
+*/
+static void FileList_Print(filelist_item_t *list, const char *types[2],
+                           const char *substr) {
+  int i;
+  filelist_item_t *item;
+  const char *desc;
+  char buf[256], buf2[256];
+  char padchar = QCHAR_COLORED('.');
+  size_t ofsdesc = list == extralevels ? maxlevelnamelen + 2 : 0;
+
+  if (substr && *substr) {
+    for (item = list, i = 0; item; item = item->next) {
+      if (list == extralevels && ExtraMaps_GetType(item) >= MAPTYPE_ID_START)
+        continue;
+      desc = ofsdesc ? ExtraMaps_GetMessage(item) : NULL;
+      if (!desc)
+        desc = "";
+      if (q_strcasestr(item->name, substr) || q_strcasestr(desc, substr)) {
+        const char *tinted_name =
+            COM_TintSubstring(item->name, substr, buf, sizeof(buf));
+        const char *tinted_desc =
+            COM_TintSubstring(desc, substr, buf2, sizeof(buf2));
+        if (*desc)
+          Con_SafePrintf("   %s%c%s\n", RightPad(tinted_name, ofsdesc, padchar),
+                         padchar, tinted_desc);
+        else
+          Con_SafePrintf("   %s\n", tinted_name);
+        i++;
+      }
+    }
+
+    if (i)
+      Con_SafePrintf("%i %s containing \"%s\"\n", i, types[i != 1], substr);
+    else
+      Con_SafePrintf("no %s found containing \"%s\"\n", types[1], substr);
+  } else {
+    for (item = list, i = 0; item; item = item->next) {
+      if (list == extralevels && ExtraMaps_GetType(item) >= MAPTYPE_ID_START)
+        continue;
+      desc = ofsdesc ? ExtraMaps_GetMessage(item) : NULL;
+      if (desc && *desc)
+        Con_SafePrintf("   %s%c%s\n", RightPad(item->name, ofsdesc, padchar),
+                       padchar, desc);
+      else
+        Con_SafePrintf("   %s\n", item->name);
+      i++;
+    }
+
+    if (i)
+      Con_SafePrintf("%i %s\n", i, types[i != 1]);
+    else
+      Con_SafePrintf("no %s found\n", types[1]);
+  }
+}
+
+/*
+==================
+ExtraMaps_Categorize
+==================
+*/
+static maptype_t ExtraMaps_Categorize(const char *name,
+                                      const searchpath_t *source) {
+  size_t len = strlen(name);
+  maptype_t base;
+  qboolean is_start, is_end, is_dm;
+
+  if (!source) {
+    switch (name[0]) {
+    case 'd':
+      if (name[1] == 'm')
+        return MAPTYPE_ID_DM;
+      break;
+    case 's':
+      if (!strcmp(name + 1, "tart"))
+        return MAPTYPE_ID_START;
+      break;
+    case 'e':
+      if (name[1] >= '1' && name[1] <= '4')
+        return MAPTYPE_ID_EP1_LEVEL + (name[1] - '1');
+      if (!strcmp(name + 1, "nd"))
+        return MAPTYPE_ID_END;
+      break;
+    default:
+      break;
+    }
+    return MAPTYPE_ID_LEVEL;
+  }
+
+  is_start = (len >= 5 && (!memcmp(name + len - 5, "start", 5) ||
+                           !memcmp(name, "start", 5) ||
+                           !memcmp(name + len - 5, "intro", 5)));
+  is_end = (len >= 3 && !memcmp(name + len - 3, "end", 3));
+  while (len > 0 && (unsigned int)(name[len - 1] - '0') <= 9)
+    len--;
+  is_dm = (len >= 2 && !memcmp(name + len - 2, "dm", 2));
+
+  if (source->path_id != com_searchpaths->path_id) {
+    if (is_start)
+      return MAPTYPE_CUSTOM_ID_START;
+    if (is_end)
+      return MAPTYPE_CUSTOM_ID_END;
+    if (is_dm)
+      return MAPTYPE_CUSTOM_ID_DM;
+    return MAPTYPE_CUSTOM_ID_LEVEL;
+  }
+
+  base = *source->filename ? MAPTYPE_CUSTOM_MOD_START : MAPTYPE_MOD_START;
+  if (is_start)
+    return base + MAPTYPE_CUSTOM_MOD_START;
+  if (is_end)
+    return base + MAPTYPE_CUSTOM_MOD_END;
+  if (is_dm)
+    return base + MAPTYPE_CUSTOM_MOD_DM;
+  return base + MAPTYPE_CUSTOM_MOD_LEVEL;
+}
+
+typedef struct levelinfo_s {
+  SDL_atomic_t type;
+  const char *message;
+} levelinfo_t;
+
+/*
+==================
+ExtraMaps_GetInfo
+==================
+*/
+static const levelinfo_t *ExtraMaps_GetInfo(const filelist_item_t *item) {
+  return (const levelinfo_t *)(item + 1);
+}
+
+/*
+==================
+ExtraMaps_GetType
+==================
+*/
+maptype_t ExtraMaps_GetType(const filelist_item_t *item) {
+  const levelinfo_t *info = ExtraMaps_GetInfo(item);
+  return SDL_AtomicGet((SDL_atomic_t *)&info->type);
+}
+
+/*
+==================
+ExtraMaps_GetMessage
+==================
+*/
+const char *ExtraMaps_GetMessage(const filelist_item_t *item) {
+  const levelinfo_t *info = ExtraMaps_GetInfo(item);
+  return (const char *)SDL_AtomicGetPtr((void **)&info->message);
+}
+
+/*
+==================
+ExtraMaps_IsStart
+==================
+*/
+qboolean ExtraMaps_IsStart(maptype_t type) {
+  return type == MAPTYPE_CUSTOM_MOD_START || type == MAPTYPE_MOD_START ||
+         type == MAPTYPE_CUSTOM_ID_START || type == MAPTYPE_ID_START;
+}
+
+/*
+==================
+ExtraMaps_Sort
+==================
+*/
+static void ExtraMaps_Sort(void) {
+  int counts[MAPTYPE_COUNT];
+  int i, sum;
+  filelist_item_t *item;
+
+  memset(counts, 0, sizeof(counts));
+  for (item = extralevels; item; item = item->next)
+    counts[ExtraMaps_GetType(item)]++;
+
+  for (i = sum = 0; i < MAPTYPE_COUNT; i++) {
+    int tmp = counts[i];
+    counts[i] = sum;
+    sum += tmp;
+  }
+  sum++; // NULL terminator
+
+  extralevels_sorted = (filelist_item_t **)realloc(
+      extralevels_sorted, sizeof(*extralevels_sorted) * sum);
+  if (!extralevels_sorted)
+    Sys_Error("ExtraMaps_Sort: out of memory on %d items", sum);
+
+  for (item = extralevels; item; item = item->next)
+    extralevels_sorted[counts[ExtraMaps_GetType(item)]++] = item;
+  extralevels_sorted[sum - 1] = NULL;
+}
+
+/*
+==================
+ExtraMaps_Add
+==================
+*/
+static void ExtraMaps_Add(const char *name, const searchpath_t *source) {
+  levelinfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.type.value = ExtraMaps_Categorize(name, source);
+  FileList_AddWithData(name, &info, sizeof(info), &extralevels);
+  maxlevelnamelen = q_max(maxlevelnamelen, strlen(name));
+}
+
+/*
+==================
+ExtraMaps_ParseDescriptions
+==================
+*/
+static int ExtraMaps_ParseDescriptions(void *unused) {
+  char buf[1024];
+  int i;
+
+  for (i = 0; extralevels_sorted[i]; i++) {
+    filelist_item_t *item = extralevels_sorted[i];
+    levelinfo_t *extra = (levelinfo_t *)(item + 1);
+
+    if (SDL_AtomicGet(&extralevels_cancel_parsing))
+      return 1;
+
+    if (!Mod_LoadMapDescription(buf, sizeof(buf), item->name))
+      SDL_AtomicSet(&extra->type, MAPTYPE_BMODEL);
+    SDL_AtomicSetPtr((void **)&extra->message, buf[0] ? strdup(buf) : "");
+  }
+
+  return 0;
+}
+
+/*
+==================
+ExtraMaps_WaitForParsingThread
+==================
+*/
+static void ExtraMaps_WaitForParsingThread(void) {
+  if (extralevels_parsing_thread) {
+    SDL_WaitThread(extralevels_parsing_thread, NULL);
+    extralevels_parsing_thread = NULL;
+    SDL_AtomicSet(&extralevels_cancel_parsing, 0);
+  }
+}
+
+/*
+==================
+ExtraMaps_Init
+==================
+*/
 void ExtraMaps_Init(void) {
-#ifdef _WIN32
-  WIN32_FIND_DATA fdat;
-  HANDLE fhnd;
-#else
-  DIR *dir_p;
-  struct dirent *dir_t;
-#endif
-  char filestring[MAX_OSPATH];
   char mapname[32];
   char ignorepakdir[32];
   searchpath_t *search;
@@ -125,55 +424,70 @@ void ExtraMaps_Init(void) {
   for (search = com_searchpaths; search; search = search->next) {
     if (*search->filename) // directory
     {
-#ifdef _WIN32
-      q_snprintf(filestring, sizeof(filestring), "%s/maps/*.bsp",
-                 search->filename);
-      fhnd = FindFirstFile(filestring, &fdat);
-      if (fhnd == INVALID_HANDLE_VALUE)
-        continue;
-      do {
-        COM_StripExtension(fdat.cFileName, mapname, sizeof(mapname));
-        ExtraMaps_Add(mapname);
-      } while (FindNextFile(fhnd, &fdat));
-      FindClose(fhnd);
-#else
-      q_snprintf(filestring, sizeof(filestring), "%s/maps/", search->filename);
-      dir_p = opendir(filestring);
-      if (dir_p == NULL)
-        continue;
-      while ((dir_t = readdir(dir_p)) != NULL) {
-        if (q_strcasecmp(COM_FileGetExtension(dir_t->d_name), "bsp") != 0)
+      char dir[MAX_OSPATH];
+      findfile_t *find;
+
+      q_snprintf(dir, sizeof(dir), "%s/maps", search->filename);
+      for (find = Sys_FindFirst(dir, "bsp"); find; find = Sys_FindNext(find)) {
+        if (find->attribs & FA_DIRECTORY)
           continue;
-        COM_StripExtension(dir_t->d_name, mapname, sizeof(mapname));
-        ExtraMaps_Add(mapname);
+        COM_StripExtension(find->name, mapname, sizeof(mapname));
+        ExtraMaps_Add(mapname, search);
       }
-      closedir(dir_p);
-#endif
     } else // pakfile
     {
-      if (!strstr(search->pack->filename,
-                  ignorepakdir)) { // don't list standard id maps
-        for (i = 0, pak = search->pack; i < pak->numfiles; i++) {
-          if (!strcmp(COM_FileGetExtension(pak->files[i].name), "bsp")) {
-            if (pak->files[i].filelen >
-                32 * 1024) { // don't list files under 32k (ammo boxes etc)
-              COM_StripExtension(pak->files[i].name + 5, mapname,
-                                 sizeof(mapname));
-              ExtraMaps_Add(mapname);
-            }
-          }
+      qboolean isbase = (strstr(search->pack->filename, ignorepakdir) != NULL);
+      for (i = 0, pak = search->pack; i < pak->numfiles; i++) {
+        if (pak->files[i].filelen >
+                32 * 1024 && // don't list files under 32k (ammo boxes etc)
+            !strncmp(pak->files[i].name, "maps/",
+                     5) && // don't list files outside of maps/
+            !strchr(pak->files[i].name + 5,
+                    '/') && // don't list files in subdirectories
+            !strcmp(COM_FileGetExtension(pak->files[i].name), "bsp")) {
+          COM_StripExtension(pak->files[i].name + 5, mapname, sizeof(mapname));
+          ExtraMaps_Add(mapname, isbase ? NULL : search);
         }
       }
     }
   }
+
+  ExtraMaps_Sort();
+
+  SDL_AtomicSet(&extralevels_cancel_parsing, 0);
+  extralevels_parsing_thread =
+      SDL_CreateThread(ExtraMaps_ParseDescriptions, "Map parser", NULL);
 }
 
-static void ExtraMaps_Clear(void) { FileList_Clear(&extralevels); }
+/*
+==================
+ExtraMaps_Clear
+==================
+*/
+void ExtraMaps_Clear(void) {
+  filelist_item_t *item;
 
-void ExtraMaps_NewGame(void) {
-  ExtraMaps_Clear();
-  ExtraMaps_Init();
+  SDL_AtomicSet(&extralevels_cancel_parsing, 1);
+  ExtraMaps_WaitForParsingThread();
+
+  maxlevelnamelen = 0;
+  for (item = extralevels; item; item = item->next) {
+    levelinfo_t *extra = (levelinfo_t *)(item + 1);
+    if (extra->message && *extra->message) {
+      free((void *)extra->message);
+      extra->message = NULL;
+    }
+  }
+
+  FileList_Clear(&extralevels);
 }
+
+/*
+==================
+ExtraMaps_ShutDown
+==================
+*/
+void ExtraMaps_ShutDown(void) { ExtraMaps_Clear(); }
 
 /*
 ==================
@@ -181,83 +495,665 @@ Host_Maps_f
 ==================
 */
 static void Host_Maps_f(void) {
-  int i;
-  filelist_item_t *level;
-
-  for (level = extralevels, i = 0; level; level = level->next, i++)
-    Con_SafePrintf("   %s\n", level->name);
-
-  if (i)
-    Con_SafePrintf("%i map(s)\n", i);
-  else
-    Con_SafePrintf("no maps found\n");
+  const char *types[] = {"map", "maps"};
+  FileList_Print(extralevels, types, Cmd_Argc() >= 2 ? Cmd_Argv(1) : NULL);
 }
 
 //==============================================================================
 // johnfitz -- modlist management
 //==============================================================================
 
-filelist_item_t *modlist;
+#define DEFAULT_ADDON_SERVER "https://kexquake.s3.amazonaws.com"
+#define ADDON_MANIFEST_FILE "content.json"
+#define MANIFEST_RETENTION (24 * 60 * 60)
 
-static void Modlist_Add(const char *name) { FileList_Add(name, &modlist); }
+static const char *const knownmods[][2] = {
+    {"id1", "Quake"},
+    {"hipnotic", "Scourge of Armagon"},
+    {"rogue", "Dissolution of Eternity"},
+    {"dopa", "Dimension of the Past"},
+    {"mg1", "Dimension of the Machine"},
+    {"q64", "Quake (Nintendo 64)"},
+    {"ctf", "Capture The Flag"},
+    {"udob", "Underdark Overbright"},
+    {"ad", "Arcane Dimensions"},
+};
 
-#ifdef _WIN32
-void Modlist_Init(void) {
-  WIN32_FIND_DATA fdat;
-  HANDLE fhnd;
-  DWORD attribs;
-  char dir_string[MAX_OSPATH], mod_string[MAX_OSPATH];
+typedef struct download_s {
+  const char **headers;
+  int num_headers;
 
-  q_snprintf(dir_string, sizeof(dir_string), "%s/*", com_basedir);
-  fhnd = FindFirstFile(dir_string, &fdat);
-  if (fhnd == INVALID_HANDLE_VALUE)
-    return;
+  size_t (*write_fn)(void *buffer, size_t size, size_t nmemb, void *stream);
+  void *write_data;
 
-  do {
-    if (!strcmp(fdat.cFileName, ".") || !strcmp(fdat.cFileName, ".."))
-      continue;
-    q_snprintf(mod_string, sizeof(mod_string), "%s/%s", com_basedir,
-               fdat.cFileName);
-    attribs = GetFileAttributes(mod_string);
-    if (attribs != INVALID_FILE_ATTRIBUTES &&
-        (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
-      /* don't bother testing for pak files / progs.dat */
-      Modlist_Add(fdat.cFileName);
-    }
-  } while (FindNextFile(fhnd, &fdat));
+  SDL_atomic_t *abort;
+  int response;
+  const char *error;
+} download_t;
 
-  FindClose(fhnd);
+static qboolean Download(const char *url, download_t *download) {
+  download->error = "download support disabled at compile time.";
+  return false;
 }
-#else
-void Modlist_Init(void) {
-  DIR *dir_p, *mod_dir_p;
-  struct dirent *dir_t;
-  char dir_string[MAX_OSPATH], mod_string[MAX_OSPATH];
 
-  q_snprintf(dir_string, sizeof(dir_string), "%s/", com_basedir);
-  dir_p = opendir(dir_string);
-  if (dir_p == NULL)
+typedef struct {
+  const char *full_name;
+  const char *author;
+  const char *description;
+  const char *date;
+  const char *download;
+  double bytes_total;
+  const jsonentry_t *json;
+  SDL_atomic_t bytes_downloaded;
+  SDL_atomic_t status;
+} modinfo_t;
+
+filelist_item_t *modlist;
+static char extramods_addons_url[MAX_URL];
+static json_t *extramods_json;
+static SDL_atomic_t extramods_json_cancel;
+static SDL_Thread *extramods_json_downloader;
+static SDL_atomic_t extramods_install_cancel;
+static SDL_Thread *extramods_install_thread;
+
+const char *Modlist_GetFullName(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  const char *full_name = info->full_name;
+  // 2021 rerelease episode names are localized
+  if (full_name && full_name[0] == '$')
+    full_name = LOC_GetRawString(full_name);
+  return full_name;
+}
+
+const char *Modlist_GetDescription(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  return info->description;
+}
+
+const char *Modlist_GetAuthor(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  return info->author;
+}
+
+const char *Modlist_GetDate(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  return info->date;
+}
+
+modstatus_t Modlist_GetStatus(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  return (modstatus_t)SDL_AtomicGet((SDL_atomic_t *)&info->status);
+}
+
+float Modlist_GetDownloadProgress(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  if (info->bytes_total <= 0.0)
+    return 0.f;
+  return CLAMP(0.0,
+               SDL_AtomicGet((SDL_atomic_t *)&info->bytes_downloaded) /
+                   info->bytes_total,
+               1.0);
+}
+
+double Modlist_GetDownloadSize(const filelist_item_t *item) {
+  const modinfo_t *info = (const modinfo_t *)(item + 1);
+  return info->bytes_total;
+}
+
+static size_t WriteManifestChunk(void *buffer, size_t size, size_t nmemb,
+                                 void *stream) {
+  if (SDL_AtomicGet(&extramods_json_cancel))
+    return 0;
+  Vec_Append((void **)stream, 1, buffer, nmemb);
+  return nmemb;
+}
+
+static void Modlist_RegisterAddons(void *param) {
+  json_t *json = (json_t *)param;
+  const jsonentry_t *addons, *entry;
+  int total, installed;
+
+  addons = JSON_Find(json->root, "addons", JSON_ARRAY);
+  if (!addons) {
+    JSON_Free(json);
     return;
-
-  while ((dir_t = readdir(dir_p)) != NULL) {
-    if (!strcmp(dir_t->d_name, ".") || !strcmp(dir_t->d_name, ".."))
-      continue;
-    if (!q_strcasecmp(COM_FileGetExtension(dir_t->d_name),
-                      "app")) // skip .app bundles on macOS
-      continue;
-    q_snprintf(mod_string, sizeof(mod_string), "%s%s/", dir_string,
-               dir_t->d_name);
-    mod_dir_p = opendir(mod_string);
-    if (mod_dir_p == NULL)
-      continue;
-    /* don't bother testing for pak files / progs.dat */
-    Modlist_Add(dir_t->d_name);
-    closedir(mod_dir_p);
   }
 
-  closedir(dir_p);
+  extramods_json = json;
+  total = 0;
+  installed = 0;
+
+  for (entry = addons->firstchild; entry; entry = entry->next) {
+    const char *download, *gamedir, *name, *author, *date, *description;
+    const double *size;
+    modinfo_t *info;
+    filelist_item_t *item;
+
+    if (entry->type != JSON_OBJECT)
+      continue;
+
+    download = JSON_FindString(entry, "download");
+    gamedir = JSON_FindString(entry, "gamedir");
+    if (!download || !gamedir)
+      continue;
+
+    name = JSON_FindString(entry, "name");
+    author = JSON_FindString(entry, "author");
+    date = JSON_FindString(entry, "date");
+    size = JSON_FindNumber(entry, "size");
+    description =
+        JSON_FindString(JSON_Find(entry, "description", JSON_OBJECT), "en");
+
+    item = FileList_AddWithData(gamedir, NULL, sizeof(*info), &modlist);
+    info = (modinfo_t *)(item + 1);
+
+    if (!info->json) {
+      info->json = entry;
+      info->full_name = name;
+      info->download = download;
+      if (size)
+        info->bytes_total = *size;
+      info->description = description;
+      info->author = author;
+      info->date = date;
+    }
+
+    total++;
+    if (Modlist_GetStatus(item) == MODSTATUS_INSTALLED)
+      installed++;
+  }
+
+  Con_SafePrintf("\n"
+                 "Add-on server status:\n"
+                 "%3d add-on%s available for download\n"
+                 "%3d add-on%s already installed\n\n",
+                 PLURAL(total - installed), PLURAL(installed));
+
+  extramods_json = json;
+
+  M_RefreshMods();
 }
+
+static void Modlist_PrintJSONHTTPError(void *param) {
+  uintptr_t status = (uintptr_t)param;
+  Con_Printf("Couldn't fetch add-on list (HTTP status %d)\n", (int)status);
+}
+
+static void Modlist_PrintJSONCurlError(void *param) {
+  Con_Printf("Failed to download add-on list (%s)\n", (const char *)param);
+}
+
+static const char *Modlist_GetInstallDir(void) {
+  return com_nightdivedir[0] ? com_nightdivedir
+                             : com_basedirs[com_numbasedirs - 1];
+}
+
+static int Modlist_DownloadJSON(void *unused) {
+  const char *accept = "Accept: application/json";
+  const char *basedir;
+  const char *installdir;
+  char cachepath[MAX_OSPATH];
+  char cacheurlpath[MAX_OSPATH];
+  char url[MAX_URL];
+  qboolean urlchanged = true;
+  download_t download;
+  char *manifest = NULL;
+  json_t *json;
+  time_t filetime;
+  time_t now;
+
+  // URL too long?
+  if ((size_t)q_snprintf(url, sizeof(url), "%s/" ADDON_MANIFEST_FILE,
+                         extramods_addons_url) >= sizeof(url))
+    return 1;
+
+  time(&now);
+  basedir = com_basedirs[com_numbasedirs - 1];
+  installdir = Modlist_GetInstallDir();
+
+  // check cached URL
+  // Note: potentially different directory than the one where addons.json is
+  // cached
+  if ((size_t)q_snprintf(cacheurlpath, sizeof(cacheurlpath),
+                         "%s/addons.url.dat", basedir) >= sizeof(cacheurlpath))
+    cacheurlpath[0] = '\0';
+  else {
+    char *cachedurl =
+        (char *)COM_LoadMallocFile_TextMode_OSPath(cacheurlpath, NULL);
+    if (cachedurl && !strcmp(cachedurl, extramods_addons_url))
+      urlchanged = false;
+    free(cachedurl);
+  }
+
+  // check cached manifest
+  if ((size_t)q_snprintf(cachepath, sizeof(cachepath), "%s/addons.json",
+                         installdir) >= sizeof(cachepath))
+    cachepath[0] = '\0';
+  else if (!urlchanged && Sys_GetFileTime(cachepath, &filetime) &&
+           difftime(now, filetime) < MANIFEST_RETENTION) {
+    manifest = (char *)COM_LoadMallocFile_TextMode_OSPath(cachepath, NULL);
+    if (manifest) {
+      json = JSON_Parse(manifest);
+      free(manifest);
+      manifest = NULL;
+      if (json)
+        goto done;
+    }
+  }
+
+  // set up download
+  memset(&download, 0, sizeof(download));
+  download.write_fn = WriteManifestChunk;
+  download.write_data = &manifest;
+  download.headers = &accept;
+  download.num_headers = 1;
+  download.abort = &extramods_json_cancel;
+
+  if (!Download(url, &download)) {
+    if (download.error)
+      Host_InvokeOnMainThread(Modlist_PrintJSONCurlError,
+                              (void *)download.error);
+    else if (download.response && download.response != 200)
+      Host_InvokeOnMainThread(Modlist_PrintJSONHTTPError,
+                              (void *)(uintptr_t)download.response);
+    VEC_FREE(manifest);
+    return 1;
+  }
+
+  if (SDL_AtomicGet(&extramods_json_cancel)) {
+    VEC_FREE(manifest);
+    return 1;
+  }
+
+  VEC_PUSH(manifest, '\0');
+  COM_NormalizeLineEndings(manifest);
+  json = JSON_Parse(manifest);
+
+  // cache manifest and URL
+  if (json && cachepath[0] && cacheurlpath[0]) {
+    COM_WriteFile_OSPath(cachepath, manifest, strlen(manifest));
+    COM_WriteFile_OSPath(cacheurlpath, extramods_addons_url,
+                         strlen(extramods_addons_url));
+  }
+
+  VEC_FREE(manifest);
+  if (!json)
+    return 1;
+
+done:
+  Host_InvokeOnMainThread(Modlist_RegisterAddons, json);
+
+  return 0;
+}
+
+typedef struct {
+  FILE *file;
+  SDL_atomic_t *progress;
+} moddownload_t;
+
+static size_t WriteModChunk(void *buffer, size_t size, size_t nmemb,
+                            void *stream) {
+  moddownload_t *dl = (moddownload_t *)stream;
+  size_t ret = fwrite(buffer, size, nmemb, dl->file);
+  SDL_AtomicAdd(dl->progress, (int)ret);
+  return ret;
+}
+
+static void Modlist_FinishInstalling(void *param) {
+  if (extramods_install_thread) {
+    SDL_WaitThread(extramods_install_thread, NULL);
+    extramods_install_thread = NULL;
+  }
+  if (param) {
+    filelist_item_t *item = (filelist_item_t *)param;
+    const char *desc = Modlist_GetFullName(item);
+    if (!desc)
+      desc = item->name;
+
+    Con_Printf("\n"
+               "Add-on \"%s\" is ready,\n"
+               "type \"game %s\" to activate.\n"
+               "\n",
+               desc, item->name);
+
+    M_OnModInstall(item->name);
+  }
+}
+
+static void Modlist_OnInstallFileCreationError(void *param) {
+  Modlist_FinishInstalling(NULL);
+  Con_Warning("Couldn't create temporary file for add-on\n");
+}
+
+static void Modlist_OnInstallHTTPError(void *param) {
+  uintptr_t status = (uintptr_t)param;
+  Modlist_FinishInstalling(NULL);
+  Con_Warning("Couldn't download add-on (HTTP status %d)\n", (int)status);
+}
+
+static void Modlist_OnInstallCurlError(void *param) {
+  Modlist_FinishInstalling(NULL);
+  Con_Warning("Couldn't download add-on (%s)\n", (const char *)param);
+}
+
+static void Modlist_OnInstallRenameError(void *param) {
+  Modlist_FinishInstalling(NULL);
+  Con_Warning("Couldn't install add-on (rename error)\n");
+}
+
+static int Modlist_InstallerThread(void *param) {
+  char url[MAX_URL];
+  char tmp[MAX_OSPATH];
+  char path[MAX_OSPATH];
+  const char *basedir;
+  FILE *file;
+  filelist_item_t *item = (filelist_item_t *)param;
+  modinfo_t *info = (modinfo_t *)(item + 1);
+  download_t download;
+  moddownload_t mod;
+  qboolean ok;
+  int i;
+
+  basedir = Modlist_GetInstallDir();
+  for (i = 0; i < 1000; i++) {
+    q_snprintf(tmp, sizeof(tmp), "%s/%s/pak0.%s.tmp", basedir, item->name,
+               COM_TempSuffix(i));
+    file = Sys_fopen(tmp, "wb");
+    if (file)
+      break;
+  }
+
+  if (!file) {
+    Host_InvokeOnMainThread(Modlist_OnInstallFileCreationError, NULL);
+    return 1;
+  }
+
+  SDL_AtomicSet(&info->bytes_downloaded, 0);
+  SDL_AtomicSet(&info->status, MODSTATUS_INSTALLING);
+
+  mod.file = file;
+  mod.progress = &info->bytes_downloaded;
+
+  memset(&download, 0, sizeof(download));
+  download.write_fn = WriteModChunk;
+  download.write_data = &mod;
+  download.abort = &extramods_install_cancel;
+
+  q_snprintf(url, sizeof(url), "%s/%s", extramods_addons_url, info->download);
+  ok = Download(url, &download);
+  fclose(file);
+
+  if (!ok) {
+    Sys_remove(tmp);
+    SDL_AtomicSet(&info->status, MODSTATUS_DOWNLOADABLE);
+    if (download.error)
+      Host_InvokeOnMainThread(Modlist_OnInstallCurlError,
+                              (void *)download.error);
+    else if (download.response && download.response != 200)
+      Host_InvokeOnMainThread(Modlist_OnInstallHTTPError,
+                              (void *)(uintptr_t)download.response);
+    return 1;
+  }
+
+  q_snprintf(path, sizeof(path), "%s/%s/pak0.pak", basedir, item->name);
+  if (Sys_rename(tmp, path) != 0) {
+    Sys_remove(tmp);
+    SDL_AtomicSet(&info->status, MODSTATUS_DOWNLOADABLE);
+    Host_InvokeOnMainThread(Modlist_OnInstallRenameError, NULL);
+    return 1;
+  }
+
+  SDL_AtomicSet(&info->status, MODSTATUS_INSTALLED);
+  Host_InvokeOnMainThread(Modlist_FinishInstalling, item);
+
+  return 0;
+}
+
+qboolean Modlist_StartInstalling(const filelist_item_t *item) {
+  const char *desc;
+  double size;
+
+  if (extramods_install_thread)
+    return false;
+
+  size = Modlist_GetDownloadSize(item);
+  desc = Modlist_GetFullName(item);
+  if (!desc)
+    desc = item->name;
+
+  if (size)
+    Con_Printf("\nDownloading \"%s\" (%.1f MB)...\n\n", desc,
+               size / (double)0x100000);
+  else
+    Con_Printf("\nDownloading \"%s\"...\n\n", desc);
+
+  SDL_AtomicSet(&extramods_install_cancel, 0);
+  extramods_install_thread =
+      SDL_CreateThread(Modlist_InstallerThread, "Mod install", (void *)item);
+
+  return extramods_install_thread != NULL;
+}
+
+qboolean Modlist_IsInstalling(void) { return extramods_install_thread != NULL; }
+
+static void Modlist_Add(const char *name) {
+  filelist_item_t *item;
+  modinfo_t *info;
+  int i;
+  unsigned int path_id;
+
+  memset(&info, 0, sizeof(info));
+  item = FileList_AddWithData(name, NULL, sizeof(*info), &modlist);
+
+  info = (modinfo_t *)(item + 1);
+  info->status.value = MODSTATUS_INSTALLED;
+
+  // look for descript.ion file in mod dir and use first non-empty line as full
+  // name
+  if (!info->full_name) {
+    for (i = com_numbasedirs - 1; i >= 0; i--) {
+      char path[MAX_OSPATH];
+      char *buf, *description, *end;
+
+      if (q_snprintf(path, sizeof(path), "%s/%s/descript.ion", com_basedirs[i],
+                     name) >= sizeof(path))
+        continue;
+
+      buf = (char *)COM_LoadMallocFile_TextMode_OSPath(path, NULL);
+      if (!buf)
+        continue;
+
+      description = buf;
+      while (q_isspace(*description))
+        ++description;
+      end = strchr(description, '\n');
+      if (end)
+        *end = '\0';
+      if (*description)
+        info->full_name = strdup(description);
+      free(buf);
+
+      if (info->full_name)
+        break;
+    }
+  }
+
+  // look for mapdb.json file
+  if (!info->full_name) {
+    char *mapdb = (char *)COM_LoadMallocFile("mapdb.json", &path_id);
+    if (mapdb) {
+      qboolean is_base_mapdb =
+          !com_searchpaths || path_id < com_searchpaths->path_id;
+      json_t *json = JSON_Parse(mapdb);
+      free(mapdb);
+      if (json) {
+        const jsonentry_t *episodes =
+            JSON_Find(json->root, "episodes", JSON_ARRAY);
+        if (episodes) {
+          const jsonentry_t *entry;
+          for (entry = episodes->firstchild; entry; entry = entry->next) {
+            const char *mod_name = JSON_FindString(entry, "name");
+            const char *mod_dir = JSON_FindString(entry, "dir");
+            if (!mod_name || !mod_dir)
+              continue;
+
+            // The 2021 rerelease has a single mapdb.json file in id1 with
+            // definitions for all the included episodes (id1, hipnotic, rogue,
+            // dopa & mg1). If the mapdb file comes from a base dir we only use
+            // the episode name if the local mod dir matches the episode dir. We
+            // also perform a dir check if the name of the episode is "copper"
+            // in order to avoid showing all Copper-based mods as "Underdark
+            // Overbright" if they include Copper's mapdb.json unmodified. In
+            // all other cases we skip the dir check so that players can rename
+            // mod dirs as they please without losing their descriptions in the
+            // add-on menu.
+            if (is_base_mapdb || q_strcasecmp(mod_dir, "copper") == 0)
+              if (q_strcasecmp(mod_dir, name) != 0)
+                continue;
+
+            info->full_name = strdup(mod_name);
+            break;
+          }
+        }
+        JSON_Free(json);
+      }
+    }
+  }
+
+  // look for mod in hard-coded list
+  if (!info->full_name) {
+    for (i = 0; i < countof(knownmods); i++) {
+      if (!q_strcasecmp(name, knownmods[i][0])) {
+        info->full_name = strdup(knownmods[i][1]);
+        break;
+      }
+    }
+  }
+}
+
+static qboolean Modlist_Check(const char *modname, const char *base) {
+  const char *assetdirs[] = {"maps", "progs", "gfx", "sound"};
+  char modpath[MAX_OSPATH];
+  char itempath[MAX_OSPATH];
+  findfile_t *find;
+  size_t i;
+
+  q_snprintf(modpath, sizeof(modpath), "%s/%s", base, modname);
+
+  q_snprintf(itempath, sizeof(itempath), "%s/pak0.pak", modpath);
+  if (Sys_FileExists(itempath))
+    return true;
+
+  q_snprintf(itempath, sizeof(itempath), "%s/progs.dat", modpath);
+  if (Sys_FileExists(itempath))
+    return true;
+
+  q_snprintf(itempath, sizeof(itempath), "%s/csprogs.dat", modpath);
+  if (Sys_FileExists(itempath))
+    return true;
+
+  for (i = 0; i < countof(assetdirs); i++) {
+    q_snprintf(itempath, sizeof(itempath), "%s/%s", modpath, assetdirs[i]);
+    for (find = Sys_FindFirst(itempath, NULL); find;
+         find = Sys_FindNext(find)) {
+      if (!strcmp(find->name, ".") || !strcmp(find->name, ".."))
+        continue;
+      Sys_FindClose(find);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void Modlist_FindLocal(void) {
+  int i;
+  findfile_t *find;
+
+  for (i = 0; i < com_numbasedirs; i++) {
+    for (find = Sys_FindFirst(com_basedirs[i], NULL); find;
+         find = Sys_FindNext(find)) {
+      if (!(find->attribs & FA_DIRECTORY))
+        continue;
+      if (!strcmp(find->name, ".") || !strcmp(find->name, ".."))
+        continue;
+#ifndef _WIN32
+      if (!q_strcasecmp(COM_FileGetExtension(find->name),
+                        "app")) // skip .app bundles on macOS
+        continue;
 #endif
+      if (Modlist_Check(find->name, com_basedirs[i])) {
+        COM_AddGameDirectory(find->name);
+        Modlist_Add(find->name);
+        COM_ResetGameDirectories("");
+      }
+    }
+  }
+}
+
+static void Modlist_FindOnline(void) {
+  const char *suffixes[] = {ADDON_MANIFEST_FILE, "index.htm", "index.html"};
+  int i, p, l;
+
+  if (COM_CheckParm("-noaddons")) {
+    Con_SafePrintf("\nAdd-on server disabled\n");
+    return;
+  }
+
+  p = COM_CheckParm("-addons");
+  if (p && p < com_argc - 1)
+    q_strlcpy(extramods_addons_url, com_argv[p + 1],
+              sizeof(extramods_addons_url));
+  else
+    q_strlcpy(extramods_addons_url, DEFAULT_ADDON_SERVER,
+              sizeof(extramods_addons_url));
+
+  // clean up URL
+  p = strlen(extramods_addons_url);
+  while (p > 0 && extramods_addons_url[p - 1] == '/')
+    --p;
+  for (i = 0; i < countof(suffixes); i++) {
+    const char *suffix = suffixes[i];
+    l = strlen(suffix);
+    if (p >= l && !q_strcasecmp(extramods_addons_url + p - l, suffix))
+      p -= l;
+  }
+  while (p > 0 && extramods_addons_url[p - 1] == '/')
+    --p;
+  extramods_addons_url[p] = '\0';
+
+  Con_SafePrintf("\nUsing add-on server \"%s\"\n", extramods_addons_url);
+
+  extramods_json_downloader =
+      SDL_CreateThread(Modlist_DownloadJSON, "JSON dl", NULL);
+}
+
+void Modlist_Init(void) {
+  Modlist_FindOnline();
+  Modlist_FindLocal();
+}
+
+void Modlist_ShutDown(void) {
+  if (extramods_json_downloader) {
+    SDL_AtomicSet(&extramods_json_cancel, 1);
+    SDL_WaitThread(extramods_json_downloader, NULL);
+    extramods_json_downloader = NULL;
+  }
+  if (extramods_install_thread) {
+    SDL_AtomicSet(&extramods_install_cancel, 1);
+    SDL_WaitThread(extramods_install_thread, NULL);
+    extramods_install_thread = NULL;
+  }
+}
+
+qboolean Modlist_IsInstalled(const char *game) {
+  filelist_item_t *item;
+  for (item = modlist; item; item = item->next)
+    if (q_strcasecmp(item->name, game) == 0 &&
+        Modlist_GetStatus(item) == MODSTATUS_INSTALLED)
+      return true;
+  return false;
+}
 
 //==============================================================================
 // ericw -- demo list management
@@ -274,14 +1170,6 @@ void DemoList_Rebuild(void) {
 
 // TODO: Factor out to a general-purpose file searching function
 void DemoList_Init(void) {
-#ifdef _WIN32
-  WIN32_FIND_DATA fdat;
-  HANDLE fhnd;
-#else
-  DIR *dir_p;
-  struct dirent *dir_t;
-#endif
-  char filestring[MAX_OSPATH];
   char demname[32];
   char ignorepakdir[32];
   searchpath_t *search;
@@ -295,29 +1183,14 @@ void DemoList_Init(void) {
   for (search = com_searchpaths; search; search = search->next) {
     if (*search->filename) // directory
     {
-#ifdef _WIN32
-      q_snprintf(filestring, sizeof(filestring), "%s/*.dem", search->filename);
-      fhnd = FindFirstFile(filestring, &fdat);
-      if (fhnd == INVALID_HANDLE_VALUE)
-        continue;
-      do {
-        COM_StripExtension(fdat.cFileName, demname, sizeof(demname));
-        FileList_Add(demname, &demolist);
-      } while (FindNextFile(fhnd, &fdat));
-      FindClose(fhnd);
-#else
-      q_snprintf(filestring, sizeof(filestring), "%s/", search->filename);
-      dir_p = opendir(filestring);
-      if (dir_p == NULL)
-        continue;
-      while ((dir_t = readdir(dir_p)) != NULL) {
-        if (q_strcasecmp(COM_FileGetExtension(dir_t->d_name), "dem") != 0)
+      findfile_t *find;
+      for (find = Sys_FindFirst(search->filename, "dem"); find;
+           find = Sys_FindNext(find)) {
+        if (find->attribs & FA_DIRECTORY)
           continue;
-        COM_StripExtension(dir_t->d_name, demname, sizeof(demname));
+        COM_StripExtension(find->name, demname, sizeof(demname));
         FileList_Add(demname, &demolist);
       }
-      closedir(dir_p);
-#endif
     } else // pakfile
     {
       if (!strstr(search->pack->filename,
@@ -333,6 +1206,139 @@ void DemoList_Init(void) {
   }
 }
 
+//==============================================================================
+// save list management
+//==============================================================================
+
+filelist_item_t *savelist;
+
+static void SaveList_Clear(void) { FileList_Clear(&savelist); }
+
+void SaveList_Rebuild(void) {
+  SaveList_Clear();
+  SaveList_Init();
+}
+
+void SaveList_Init(void) {
+  char dirname[MAX_OSPATH];
+  char savename[MAX_QPATH];
+  findfile_t *find;
+
+  for (find = Sys_FindFirst(com_gamedir, "sav"); find;
+       find = Sys_FindNext(find)) {
+    if (find->attribs & FA_DIRECTORY)
+      continue;
+    COM_StripExtension(find->name, savename, sizeof(savename));
+    FileList_Add(savename, &savelist);
+  }
+
+  if ((size_t)q_snprintf(dirname, sizeof(dirname), "%s/autosave", com_gamedir) <
+      sizeof(dirname)) {
+    for (find = Sys_FindFirst(dirname, "sav"); find;
+         find = Sys_FindNext(find)) {
+      char filename[MAX_QPATH];
+      if (find->attribs & FA_DIRECTORY)
+        continue;
+      COM_StripExtension(find->name, filename, sizeof(filename));
+      if ((size_t)q_snprintf(savename, sizeof(savename), "autosave/%s",
+                             filename) < sizeof(savename))
+        FileList_Add(savename, &savelist);
+    }
+  }
+}
+
+//==============================================================================
+// sky list management
+//==============================================================================
+
+filelist_item_t *skylist;
+
+static void SkyList_Clear(void) { FileList_Clear(&skylist); }
+
+void SkyList_Rebuild(void) {
+  SkyList_Clear();
+  SkyList_Init();
+}
+
+static qboolean SkyList_AddFile(const char *path) {
+  const char prefix[] = "gfx/env/";
+  const char suffix[] = "up";
+  const char *ext;
+  char skyname[MAX_QPATH];
+  size_t len;
+
+  // Check that the file is in the right directory
+  // We need this for pak files, which are all passed to this function
+  // without any kind of path filtering
+  if (q_strncasecmp(path, prefix, sizeof(prefix) - 1) != 0)
+    return false;
+  path += sizeof(prefix) - 1;
+
+  // Only accept TGA files
+  ext = COM_FileGetExtension(path);
+  if (q_strcasecmp(ext, "tga") != 0)
+    return false;
+
+  // Check that the image has the right suffix
+  COM_StripExtension(path, skyname, sizeof(skyname));
+  len = strlen(skyname);
+  if (len < sizeof(suffix) - 1)
+    return false;
+  len -= sizeof(suffix) - 1;
+  if (q_strcasecmp(skyname + len, suffix) != 0)
+    return false;
+  skyname[len] = '\0';
+
+  // All ok, add skybox to the list
+  FileList_Add(skyname, &skylist);
+
+  return true;
+}
+
+static void SkyList_AddDirRec(const char *root, const char *relpath) {
+  findfile_t *find;
+  char child[MAX_OSPATH];
+  char fullpath[MAX_OSPATH];
+
+  q_snprintf(fullpath, sizeof(fullpath), "%s/%s", root, relpath);
+  for (find = Sys_FindFirst(fullpath, NULL); find; find = Sys_FindNext(find)) {
+    q_snprintf(child, sizeof(child), "%s/%s", relpath, find->name);
+    if (find->attribs & FA_DIRECTORY) {
+      if (find->name[0] == '.')
+        continue;
+      SkyList_AddDirRec(root, child);
+      continue;
+    }
+    SkyList_AddFile(child);
+  }
+}
+
+void SkyList_Init(void) {
+  searchpath_t *search;
+  pack_t *pak;
+  int i;
+
+  for (search = com_searchpaths; search; search = search->next) {
+    if (*search->filename) // directory
+      SkyList_AddDirRec(search->filename, "gfx/env");
+    else // pakfile
+      for (i = 0, pak = search->pack; i < pak->numfiles; i++)
+        SkyList_AddFile(pak->files[i].name);
+  }
+}
+
+/*
+==================
+Host_Skies_f
+
+list all potential skies
+==================
+*/
+static void Host_Skies_f(void) {
+  const char *types[] = {"sky", "skies"};
+  FileList_Print(skylist, types, Cmd_Argc() >= 2 ? Cmd_Argv(1) : NULL);
+}
+
 /*
 ==================
 Host_Mods_f -- johnfitz
@@ -341,16 +1347,8 @@ list all potential mod directories (contain either a pak file or a progs.dat)
 ==================
 */
 static void Host_Mods_f(void) {
-  int i;
-  filelist_item_t *mod;
-
-  for (mod = modlist, i = 0; mod; mod = mod->next, i++)
-    Con_SafePrintf("   %s\n", mod->name);
-
-  if (i)
-    Con_SafePrintf("%i mod(s)\n", i);
-  else
-    Con_SafePrintf("no mods found\n");
+  const char *types[] = {"mod", "mods"};
+  FileList_Print(modlist, types, Cmd_Argc() >= 2 ? Cmd_Argv(1) : NULL);
 }
 
 //==============================================================================
@@ -573,10 +1571,11 @@ static void Host_SetPos_f(void) {
     SV_ClientPrintf("   setpos <x> <y> <z>\n");
     SV_ClientPrintf("   setpos <x> <y> <z> <pitch> <yaw> <roll>\n");
     SV_ClientPrintf("current values:\n");
-    SV_ClientPrintf("   %i %i %i %i %i %i\n", (int)sv_player->v.origin[0],
-                    (int)sv_player->v.origin[1], (int)sv_player->v.origin[2],
-                    (int)sv_player->v.v_angle[0], (int)sv_player->v.v_angle[1],
-                    (int)sv_player->v.v_angle[2]);
+    SV_ClientPrintf(
+        "   %i %i %i %i %i %i\n", Q_rint(sv_player->v.origin[0]),
+        Q_rint(sv_player->v.origin[1]), Q_rint(sv_player->v.origin[2]),
+        Q_rint(sv_player->v.v_angle[0]), Q_rint(sv_player->v.v_angle[1]),
+        Q_rint(sv_player->v.v_angle[2]));
     return;
   }
 
@@ -731,7 +1730,9 @@ static void Host_Map_f(void) {
   p = strstr(name, ".bsp");
   if (p && p[4] == '\0')
     *p = '\0';
+  PR_SwitchQCVM(&sv.qcvm);
   SV_SpawnServer(name);
+  PR_SwitchQCVM(NULL);
   if (!sv.active)
     return;
 
@@ -781,6 +1782,38 @@ static void Host_Randmap_f(void) {
 
 /*
 ==================
+Host_AutoLoad
+==================
+*/
+static qboolean Host_AutoLoad(void) {
+  if (!sv_autoload.value || !sv.lastsave[0] || svs.maxclients != 1 ||
+      cl.intermission)
+    return false;
+
+  if (sv_autoload.value < 2.f) {
+    if (!SCR_ModalMessage("Load last save? (y/n)", 0.f)) {
+      sv.lastsave[0] = '\0';
+      return false;
+    }
+  } else if (sv_autoload.value < 3.f && sv_player->v.health > 0.f)
+    return false;
+
+  sv.autoloading = true;
+  Con_Printf("Autoloading...\n");
+  Cbuf_AddText(va("load \"%s\"\n", sv.lastsave));
+  Cbuf_Execute();
+
+  if (sv.autoloading) {
+    sv.autoloading = false;
+    Con_Printf("Autoload failed!\n");
+    return false;
+  }
+
+  return true;
+}
+
+/*
+==================
 Host_Changelevel_f
 
 Goes to a new map, taking all clients along
@@ -804,12 +1837,17 @@ static void Host_Changelevel_f(void) {
     Host_Error("cannot find map %s", level);
   // johnfitz
 
+  q_strlcpy(level, Cmd_Argv(1), sizeof(level));
+  if (!strcmp(sv.name, level) && Host_AutoLoad())
+    return;
+
   if (cls.state != ca_dedicated)
     IN_Activate();     // -- S.A.
   key_dest = key_game; // remove console or menu
+  PR_SwitchQCVM(&sv.qcvm);
   SV_SaveSpawnparms();
-  q_strlcpy(level, Cmd_Argv(1), sizeof(level));
   SV_SpawnServer(level);
+  PR_SwitchQCVM(NULL);
   // also issue an error if spawn failed -- O.S.
   if (!sv.active)
     Host_Error("cannot run map %s", level);
@@ -830,9 +1868,15 @@ static void Host_Restart_f(void) {
 
   if (cmd_source != src_command)
     return;
+
+  if (Host_AutoLoad())
+    return;
+
   q_strlcpy(mapname, sv.name,
             sizeof(mapname)); // mapname gets cleared in spawnserver
+  PR_SwitchQCVM(&sv.qcvm);
   SV_SpawnServer(mapname);
+  PR_SwitchQCVM(NULL);
   if (!sv.active)
     Host_Error("cannot restart map %s", mapname);
 }
@@ -881,7 +1925,12 @@ LOAD / SAVE GAME
 ===============================================================================
 */
 
-#define SAVEGAME_VERSION 5
+static savedata_t save_data;
+static qboolean save_pending;
+static SDL_Thread *save_thread;
+static SDL_mutex *save_mutex;
+static SDL_cond *save_finished_condition;
+static SDL_cond *save_pending_condition;
 
 /*
 ===============
@@ -890,8 +1939,9 @@ Host_SavegameComment
 Writes a SAVEGAME_COMMENT_LENGTH character comment describing the current
 ===============
 */
-static void Host_SavegameComment(char text[SAVEGAME_COMMENT_LENGTH + 1]) {
+void Host_SavegameComment(char text[SAVEGAME_COMMENT_LENGTH + 1]) {
   int i;
+  char *levelname;
   char kills[20];
   char *p;
 
@@ -899,10 +1949,12 @@ static void Host_SavegameComment(char text[SAVEGAME_COMMENT_LENGTH + 1]) {
     text[i] = ' ';
   text[SAVEGAME_COMMENT_LENGTH] = '\0';
 
-  i = (int)strlen(cl.levelname);
+  levelname = cl.levelname[0] ? cl.levelname : cl.mapname;
+
+  i = (int)strlen(levelname);
   if (i > 22)
     i = 22;
-  memcpy(text, cl.levelname, (size_t)i);
+  memcpy(text, levelname, (size_t)i);
 
   // Remove CR/LFs from level name to avoid broken saves, e.g. with autumn_sp
   // map: https://celephais.net/board/view_thread.php?id=60452&start=3666
@@ -922,16 +1974,124 @@ static void Host_SavegameComment(char text[SAVEGAME_COMMENT_LENGTH + 1]) {
   }
 }
 
+static void Host_InvalidateSave(const char *relname) {
+  if (!strcmp(sv.lastsave, relname))
+    sv.lastsave[0] = '\0';
+}
+
+void Host_ShutdownSave(void) {
+  if (!save_mutex)
+    return; // not initialized yet
+
+  SDL_LockMutex(save_mutex);
+  while (save_pending)
+    SDL_CondWait(save_finished_condition, save_mutex);
+  save_pending = true;
+  save_data.file = NULL;
+  SDL_CondSignal(save_pending_condition);
+  SDL_UnlockMutex(save_mutex);
+
+  SDL_WaitThread(save_thread, NULL);
+  save_thread = NULL;
+
+  SDL_DestroyCond(save_finished_condition);
+  save_finished_condition = NULL;
+
+  SDL_DestroyCond(save_pending_condition);
+  save_pending_condition = NULL;
+
+  SaveData_Clear(&save_data);
+}
+
+void Host_WaitForSaveThread(void) {
+  SDL_LockMutex(save_mutex);
+  while (save_pending)
+    SDL_CondWait(save_finished_condition, save_mutex);
+  SDL_UnlockMutex(save_mutex);
+}
+
+qboolean Host_IsSaving(void) {
+  qboolean saving;
+  SDL_LockMutex(save_mutex);
+  saving = save_pending;
+  SDL_UnlockMutex(save_mutex);
+
+  if (saving)
+    return true;
+
+  if (save_data.abort.value && sv.lastsave[0]) {
+    sv.lastsave[0] = '\0';
+    if (save_data.abort.value < 0)
+      Con_Printf("Save error.\n");
+  }
+
+  return false;
+}
+
+static int Host_BackgroundSave(void *param) {
+  savedata_t *save = (savedata_t *)param;
+
+  while (true) {
+    edict_t *ed;
+    int i;
+    qboolean abort = false;
+
+    SDL_LockMutex(save_mutex);
+    while (!save_pending)
+      SDL_CondWait(save_pending_condition, save_mutex);
+    SDL_UnlockMutex(save_mutex);
+
+    if (!save->file)
+      break;
+
+    PR_SwitchQCVM(&sv.qcvm);
+    SaveData_WriteHeader(save);
+    for (i = 0, ed = save->edicts; i < save->num_edicts;
+         i++, ed = NEXT_EDICT(ed)) {
+      if (SDL_AtomicGet(&save->abort)) {
+        abort = true;
+        break;
+      }
+      ED_Write(save, ed);
+      fflush(save->file);
+    }
+    if (!abort)
+      fprintf(save->file, "// %d edicts\n", save->num_edicts);
+    PR_SwitchQCVM(NULL);
+
+    fclose(save->file);
+    save->file = NULL;
+    if (abort)
+      Sys_remove(save->path);
+
+    SDL_LockMutex(save_mutex);
+    save_pending = false;
+    SDL_CondSignal(save_finished_condition);
+    SDL_UnlockMutex(save_mutex);
+  }
+
+  return 0;
+}
+
+static void Host_InitSaveThread(void) {
+  save_mutex = SDL_CreateMutex();
+  save_finished_condition = SDL_CreateCond();
+  save_pending_condition = SDL_CreateCond();
+  save_thread = SDL_CreateThread(Host_BackgroundSave, "SaveThread", &save_data);
+  SaveData_Init(&save_data);
+}
+
 /*
 ===============
 Host_Savegame_f
 ===============
 */
 static void Host_Savegame_f(void) {
+  char relname[MAX_OSPATH];
   char name[MAX_OSPATH];
+  const char *skipnotify;
   FILE *f;
   int i;
-  char comment[SAVEGAME_COMMENT_LENGTH + 1];
 
   if (cmd_source != src_command)
     return;
@@ -956,7 +2116,7 @@ static void Host_Savegame_f(void) {
     return;
   }
 
-  if (Cmd_Argc() != 2) {
+  if (Cmd_Argc() < 2) {
     Con_Printf("save <savename> : save a game\n");
     return;
   }
@@ -973,40 +2133,50 @@ static void Host_Savegame_f(void) {
     }
   }
 
-  q_snprintf(name, sizeof(name), "%s/%s", com_gamedir, Cmd_Argv(1));
-  COM_AddExtension(name, ".sav", sizeof(name));
+  q_strlcpy(relname, Cmd_Argv(1), sizeof(relname));
+  COM_AddExtension(relname, ".sav", sizeof(relname));
+  q_snprintf(name, sizeof(name), "%s/%s", com_gamedir, relname);
 
-  Con_Printf("Saving game to %s...\n", name);
-  f = fopen(name, "w");
+  // second argument, if present, indicates whether or not text should be
+  // printed to the notification area
+  skipnotify = (Cmd_Argc() < 3 || atof(Cmd_Argv(2))) ? "" : "[skipnotify]";
+  Con_SafePrintf("%sSaving game to ", skipnotify);
+  Con_LinkPrintf(name, "%s%s", skipnotify, relname);
+  Con_SafePrintf("%s...\n", skipnotify);
+
+  if (!strcmp(relname, sv.lastsave) && Host_IsSaving()) {
+    SDL_AtomicCAS(&save_data.abort, 0, 1);
+    SDL_LockMutex(save_mutex);
+    while (save_pending)
+      SDL_CondWait(save_finished_condition, save_mutex);
+    SDL_UnlockMutex(save_mutex);
+  }
+
+  f = Sys_fopen(name, "w");
   if (!f) {
     Con_Printf("ERROR: couldn't open.\n");
     return;
   }
 
-  fprintf(f, "%i\n", SAVEGAME_VERSION);
-  Host_SavegameComment(comment);
-  fprintf(f, "%s\n", comment);
-  for (i = 0; i < NUM_SPAWN_PARMS; i++)
-    fprintf(f, "%f\n", svs.clients->spawn_parms[i]);
-  fprintf(f, "%d\n", current_skill);
-  fprintf(f, "%s\n", sv.name);
-  fprintf(f, "%f\n", sv.time);
+  SDL_LockMutex(save_mutex);
+  while (save_pending)
+    SDL_CondWait(save_finished_condition, save_mutex);
 
-  // write the light styles
-  for (i = 0; i < MAX_LIGHTSTYLES; i++) {
-    if (sv.lightstyles[i])
-      fprintf(f, "%s\n", sv.lightstyles[i]);
-    else
-      fprintf(f, "m\n");
-  }
+  q_strlcpy(save_data.path, name, sizeof(save_data.path));
+  save_data.file = f;
+  save_data.abort.value = 0;
 
-  ED_WriteGlobals(f);
-  for (i = 0; i < sv.num_edicts; i++) {
-    ED_Write(f, EDICT_NUM(i));
-    fflush(f);
-  }
-  fclose(f);
-  Con_Printf("done.\n");
+  PR_SwitchQCVM(&sv.qcvm);
+  SaveData_Fill(&save_data);
+  PR_SwitchQCVM(NULL);
+
+  save_pending = true;
+  SDL_CondSignal(save_pending_condition);
+  SDL_UnlockMutex(save_mutex);
+
+  q_strlcpy(sv.lastsave, relname, sizeof(sv.lastsave));
+  COM_StripExtension(sv.lastsave, relname, sizeof(relname));
+  FileList_Add(relname, &savelist);
 }
 
 /*
@@ -1018,6 +2188,7 @@ static void Host_Loadgame_f(void) {
   static char *start;
 
   char name[MAX_OSPATH];
+  char relname[MAX_OSPATH];
   char mapname[MAX_QPATH];
   float time, tfloat;
   const char *data;
@@ -1026,11 +2197,12 @@ static void Host_Loadgame_f(void) {
   int entnum;
   int version;
   float spawn_parms[NUM_SPAWN_PARMS];
+  qboolean kexonly = false;
 
   if (cmd_source != src_command)
     return;
 
-  if (Cmd_Argc() != 2) {
+  if (Cmd_Argc() < 2) {
     Con_Printf("load <savename> : load a game\n");
     return;
   }
@@ -1040,6 +2212,11 @@ static void Host_Loadgame_f(void) {
     return;
   }
 
+  // When loading a file that doesn't belong to a mod dir we only accept KEX
+  // saves
+  if (Cmd_Argc() >= 3 && q_strcasecmp(Cmd_Argv(2), "kex") == 0)
+    kexonly = true;
+
   if (nomonsters.value) {
     Con_Warning("\"%s\" disabled automatically.\n", nomonsters.name);
     Cvar_SetValueQuick(&nomonsters, 0.f);
@@ -1047,14 +2224,33 @@ static void Host_Loadgame_f(void) {
 
   cls.demonum = -1; // stop demo loop in case this fails
 
-  q_snprintf(name, sizeof(name), "%s/%s", com_gamedir, Cmd_Argv(1));
-  COM_AddExtension(name, ".sav", sizeof(name));
+  q_strlcpy(relname, Cmd_Argv(1), sizeof(relname));
+  COM_AddExtension(relname, ".sav", sizeof(relname));
 
-  // we can't call SCR_BeginLoadingPlaque, because too much stack space has
-  // been used.  The menu calls it before stuffing loadgame command
-  //	SCR_BeginLoadingPlaque ();
+  q_snprintf(name, sizeof(name), "%s/%s", com_gamedir, relname);
 
-  Con_Printf("Loading game from %s...\n", name);
+  // Look for savefile in basedirs instead of gamedir
+  if (kexonly || !Sys_FileExists(name)) {
+    for (i = com_numbasedirs - 1; i >= 0; i--) {
+      q_snprintf(name, sizeof(name), "%s/%s", com_basedirs[i], relname);
+      if (Sys_FileExists(name)) {
+        kexonly = true;
+        break;
+      }
+    }
+  }
+
+  if (!Sys_FileExists(name)) {
+    Con_Printf("ERROR: %s not found.\n", relname);
+    Host_InvalidateSave(relname);
+    return;
+  }
+
+  Con_SafePrintf("Loading game from ");
+  Con_LinkPrintf(name, "%s", relname);
+  Con_SafePrintf("...\n");
+
+  SCR_BeginLoadingPlaque();
 
   // avoid leaking if the previous Host_Loadgame_f failed with a Host_Error
   if (start != NULL)
@@ -1063,15 +2259,37 @@ static void Host_Loadgame_f(void) {
   start = (char *)COM_LoadMallocFile_TextMode_OSPath(name, NULL);
   if (start == NULL) {
     Con_Printf("ERROR: couldn't open.\n");
+    Host_InvalidateSave(relname);
+    SCR_EndLoadingPlaque();
     return;
   }
 
   data = start;
   data = COM_ParseIntNewline(data, &version);
-  if (version != SAVEGAME_VERSION) {
+  if (version == SAVEGAME_VERSION_KEX) {
+    extern char com_gamenames[];
+    const char *game = *com_gamenames ? com_gamenames : GAMENAME;
+    data = COM_ParseStringNewline(data);
+    if (strcmp(game, com_token) != 0) {
+      if (!Modlist_IsInstalled(com_token)) {
+        Con_Printf("ERROR: mod \"%s\" is not installed.\n", com_token);
+        return;
+      }
+      COM_SwitchGame(com_token);
+      Cbuf_Execute();
+      if (key_dest == key_menu)
+        M_ToggleMenu_f();
+    }
+  } else if (version != SAVEGAME_VERSION || kexonly) {
+    int expected = kexonly ? SAVEGAME_VERSION_KEX : SAVEGAME_VERSION;
     free(start);
     start = NULL;
-    Host_Error("Savegame is version %i, not %i", version, SAVEGAME_VERSION);
+    if (sv.autoloading)
+      Con_Printf("ERROR: Savegame is version %i, not %i\n", version, expected);
+    else
+      Host_Error("Savegame is version %i, not %i", version, expected);
+    Host_InvalidateSave(relname);
+    SCR_EndLoadingPlaque();
     return;
   }
   data = COM_ParseStringNewline(data);
@@ -1089,9 +2307,11 @@ static void Host_Loadgame_f(void) {
 
   CL_Disconnect_f();
 
+  PR_SwitchQCVM(&sv.qcvm);
   SV_SpawnServer(mapname);
 
   if (!sv.active) {
+    PR_SwitchQCVM(NULL);
     free(start);
     start = NULL;
     SCR_EndLoadingPlaque();
@@ -1121,11 +2341,10 @@ static void Host_Loadgame_f(void) {
       data = ED_ParseGlobals(data);
     } else { // parse an edict
       ent = EDICT_NUM(entnum);
-      if (entnum < sv.num_edicts) {
-        ent->free = false;
-        memset(&ent->v, 0, progs->entityfields * 4);
+      if (entnum < qcvm->num_edicts) {
+        ED_ClearEdict(ent);
       } else {
-        memset(ent, 0, pr_edict_size);
+        memset(ent, 0, qcvm->edict_size);
         ent->baseline.scale = ENTSCALE_DEFAULT;
       }
       data = ED_ParseEdict(data, ent);
@@ -1139,12 +2358,15 @@ static void Host_Loadgame_f(void) {
   }
 
   // Free edicts allocated during map loading but no longer used after restoring
-  // saved game state
-  for (i = entnum; i < sv.num_edicts; i++)
-    ED_Free(EDICT_NUM(i));
+  // saved game state Note: we use ED_ClearEdict instead of ED_Free to avoid
+  // placing entities >= num_edicts in the free list This is different from
+  // QuakeSpasm, which doesn't use a free list
+  for (i = entnum; i < qcvm->num_edicts; i++)
+    ED_ClearEdict(EDICT_NUM(i));
 
-  sv.num_edicts = entnum;
-  sv.time = time;
+  qcvm->num_edicts = entnum;
+  qcvm->time = time;
+  sv.autosave.time = time;
 
   free(start);
   start = NULL;
@@ -1152,12 +2374,16 @@ static void Host_Loadgame_f(void) {
   for (i = 0; i < NUM_SPAWN_PARMS; i++)
     svs.clients->spawn_parms[i] = spawn_parms[i];
 
+  PR_SwitchQCVM(NULL);
+
+  q_strlcpy(sv.lastsave, relname, sizeof(sv.lastsave));
+
   if (cls.state != ca_dedicated) {
     CL_EstablishConnection("local");
     Host_Reconnect_f();
   }
 
-  if (cls.state != ca_dedicated)
+  if (cls.state != ca_dedicated && key_dest == key_game)
     IN_Activate(); // moved to here from M_Load_Key()
 }
 
@@ -1396,7 +2622,7 @@ static void Host_Kill_f(void) {
     return;
   }
 
-  pr_global_struct->time = sv.time;
+  pr_global_struct->time = qcvm->time;
   pr_global_struct->self = EDICT_TO_PROG(sv_player);
   PR_ExecuteProgram(pr_global_struct->ClientKill);
 }
@@ -1410,7 +2636,6 @@ static void Host_Pause_f(void) {
   // ericw -- demo pause support (inspired by MarkV)
   if (cls.demoplayback) {
     cls.demopaused = !cls.demopaused;
-    cl.paused = cls.demopaused;
     return;
   }
 
@@ -1487,7 +2712,7 @@ static void Host_Spawn_f(void) {
     // set up the edict
     ent = host_client->edict;
 
-    memset(&ent->v, 0, progs->entityfields * 4);
+    memset(&ent->v, 0, qcvm->progs->entityfields * 4);
     ent->v.colormap = NUM_FOR_EDICT(ent);
     ent->v.team = (host_client->colors & 15) + 1;
     ent->v.netname = PR_SetEngineString(host_client->name);
@@ -1496,12 +2721,12 @@ static void Host_Spawn_f(void) {
     for (i = 0; i < NUM_SPAWN_PARMS; i++)
       (&pr_global_struct->parm1)[i] = host_client->spawn_parms[i];
     // call the spawn function
-    pr_global_struct->time = sv.time;
+    pr_global_struct->time = qcvm->time;
     pr_global_struct->self = EDICT_TO_PROG(sv_player);
     PR_ExecuteProgram(pr_global_struct->ClientConnect);
 
     if ((Sys_DoubleTime() - NET_QSocketGetTime(host_client->netconnection)) <=
-        sv.time)
+        qcvm->time)
       Sys_Printf("%s entered the game\n", host_client->name);
 
     PR_ExecuteProgram(pr_global_struct->PutClientInServer);
@@ -1512,7 +2737,7 @@ static void Host_Spawn_f(void) {
 
   // send time of update
   MSG_WriteByte(&host_client->message, svc_time);
-  MSG_WriteFloat(&host_client->message, sv.time);
+  MSG_WriteFloat(&host_client->message, qcvm->time);
 
   for (i = 0, client = svs.clients; i < svs.maxclients; i++, client++) {
     MSG_WriteByte(&host_client->message, svc_updatename);
@@ -1561,7 +2786,11 @@ static void Host_Spawn_f(void) {
   ent = EDICT_NUM(1 + (host_client - svs.clients));
   MSG_WriteByte(&host_client->message, svc_setangle);
   for (i = 0; i < 2; i++)
-    MSG_WriteAngle(&host_client->message, ent->v.angles[i], sv.protocolflags);
+    if (sv.loadgame)
+      MSG_WriteAngle(&host_client->message, ent->v.v_angle[i],
+                     sv.protocolflags);
+    else
+      MSG_WriteAngle(&host_client->message, ent->v.angles[i], sv.protocolflags);
   MSG_WriteAngle(&host_client->message, 0, sv.protocolflags);
 
   SV_WriteClientdataToMessage(sv_player, &host_client->message);
@@ -1726,7 +2955,7 @@ static void Host_Give_f(void) {
 
   case 's':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_shells1");
+      val = GetEdictFieldValueByName(sv_player, "ammo_shells1");
       if (val)
         val->_float = v;
     }
@@ -1735,7 +2964,7 @@ static void Host_Give_f(void) {
 
   case 'n':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_nails1");
+      val = GetEdictFieldValueByName(sv_player, "ammo_nails1");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon <= IT_LIGHTNING)
@@ -1748,7 +2977,7 @@ static void Host_Give_f(void) {
 
   case 'l':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_lava_nails");
+      val = GetEdictFieldValueByName(sv_player, "ammo_lava_nails");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon > IT_LIGHTNING)
@@ -1759,7 +2988,7 @@ static void Host_Give_f(void) {
 
   case 'r':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_rockets1");
+      val = GetEdictFieldValueByName(sv_player, "ammo_rockets1");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon <= IT_LIGHTNING)
@@ -1772,7 +3001,7 @@ static void Host_Give_f(void) {
 
   case 'm':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_multi_rockets");
+      val = GetEdictFieldValueByName(sv_player, "ammo_multi_rockets");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon > IT_LIGHTNING)
@@ -1787,7 +3016,7 @@ static void Host_Give_f(void) {
 
   case 'c':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_cells1");
+      val = GetEdictFieldValueByName(sv_player, "ammo_cells1");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon <= IT_LIGHTNING)
@@ -1800,7 +3029,7 @@ static void Host_Give_f(void) {
 
   case 'p':
     if (rogue) {
-      val = GetEdictFieldValue(sv_player, "ammo_plasma");
+      val = GetEdictFieldValueByName(sv_player, "ammo_plasma");
       if (val) {
         val->_float = v;
         if (sv_player->v.weapon > IT_LIGHTNING)
@@ -1876,15 +3105,22 @@ static void Host_Give_f(void) {
 
 static edict_t *FindViewthing(void) {
   int i;
-  edict_t *e;
+  edict_t *e = NULL;
 
-  for (i = 0; i < sv.num_edicts; i++) {
+  PR_SwitchQCVM(&sv.qcvm);
+  for (i = 0; i < qcvm->num_edicts; i++) {
     e = EDICT_NUM(i);
     if (!strcmp(PR_GetString(e->v.classname), "viewthing"))
-      return e;
+      break;
   }
-  Con_Printf("No viewthing on map\n");
-  return NULL;
+
+  if (i == qcvm->num_edicts) {
+    e = NULL;
+    Con_Printf("No viewthing on map\n");
+  }
+
+  PR_SwitchQCVM(NULL);
+  return e;
 }
 
 /*
@@ -1906,8 +3142,10 @@ static void Host_Viewmodel_f(void) {
     return;
   }
 
+  PR_SwitchQCVM(&sv.qcvm);
   e->v.frame = 0;
   cl.model_precache[(int)e->v.modelindex] = m;
+  PR_SwitchQCVM(NULL);
 }
 
 /*
@@ -2018,10 +3256,10 @@ static void Host_Startdemos_f(void) {
 
   if (!sv.active && cls.demonum != -1 && !cls.demoplayback) {
     cls.demonum = 0;
+    Cbuf_InsertText("menu_main\n");
     if (!fitzmode && !cl_startdemos.value) { /* QuakeSpasm customization: */
       /* go straight to menu, no CL_NextDemo */
       cls.demonum = -1;
-      Cbuf_InsertText("menu_main\n");
       return;
     }
     CL_NextDemo();
@@ -2082,41 +3320,44 @@ Host_InitCommands
 ==================
 */
 void Host_InitCommands(void) {
+  Host_InitSaveThread();
+
   Cmd_AddCommand("maps", Host_Maps_f); // johnfitz
   Cmd_AddCommand("mods", Host_Mods_f); // johnfitz
   Cmd_AddCommand("games",
                  Host_Mods_f); // as an alias to "mods" -- S.A. / QuakeSpasm
+  Cmd_AddCommand("skies", Host_Skies_f);     // ericw
   Cmd_AddCommand("mapname", Host_Mapname_f); // johnfitz
   Cmd_AddCommand("randmap", Host_Randmap_f); // ericw
 
-  Cmd_AddCommand("status", Host_Status_f);
+  Cmd_AddCommand_ClientCommand("status", Host_Status_f);
   Cmd_AddCommand("quit", Host_Quit_f);
-  Cmd_AddCommand("god", Host_God_f);
-  Cmd_AddCommand("notarget", Host_Notarget_f);
-  Cmd_AddCommand("fly", Host_Fly_f);
+  Cmd_AddCommand_ClientCommand("god", Host_God_f);
+  Cmd_AddCommand_ClientCommand("notarget", Host_Notarget_f);
+  Cmd_AddCommand_ClientCommand("fly", Host_Fly_f);
   Cmd_AddCommand("map", Host_Map_f);
   Cmd_AddCommand("restart", Host_Restart_f);
   Cmd_AddCommand("changelevel", Host_Changelevel_f);
   Cmd_AddCommand("connect", Host_Connect_f);
-  Cmd_AddCommand("reconnect", Host_Reconnect_f);
-  Cmd_AddCommand("name", Host_Name_f);
-  Cmd_AddCommand("noclip", Host_Noclip_f);
-  Cmd_AddCommand("setpos", Host_SetPos_f); // QuakeSpasm
+  Cmd_AddCommand_Console("reconnect", Host_Reconnect_f);
+  Cmd_AddCommand_ClientCommand("name", Host_Name_f);
+  Cmd_AddCommand_ClientCommand("noclip", Host_Noclip_f);
+  Cmd_AddCommand_ClientCommand("setpos", Host_SetPos_f); // QuakeSpasm
 
-  Cmd_AddCommand("say", Host_Say_f);
-  Cmd_AddCommand("say_team", Host_Say_Team_f);
-  Cmd_AddCommand("tell", Host_Tell_f);
-  Cmd_AddCommand("color", Host_Color_f);
-  Cmd_AddCommand("kill", Host_Kill_f);
-  Cmd_AddCommand("pause", Host_Pause_f);
-  Cmd_AddCommand("spawn", Host_Spawn_f);
-  Cmd_AddCommand("begin", Host_Begin_f);
-  Cmd_AddCommand("prespawn", Host_PreSpawn_f);
-  Cmd_AddCommand("kick", Host_Kick_f);
-  Cmd_AddCommand("ping", Host_Ping_f);
+  Cmd_AddCommand_ClientCommand("say", Host_Say_f);
+  Cmd_AddCommand_ClientCommand("say_team", Host_Say_Team_f);
+  Cmd_AddCommand_ClientCommand("tell", Host_Tell_f);
+  Cmd_AddCommand_ClientCommand("color", Host_Color_f);
+  Cmd_AddCommand_ClientCommand("kill", Host_Kill_f);
+  Cmd_AddCommand_ClientCommand("pause", Host_Pause_f);
+  Cmd_AddCommand_ClientCommand("spawn", Host_Spawn_f);
+  Cmd_AddCommand_ClientCommand("begin", Host_Begin_f);
+  Cmd_AddCommand_ClientCommand("prespawn", Host_PreSpawn_f);
+  Cmd_AddCommand_ClientCommand("kick", Host_Kick_f);
+  Cmd_AddCommand_ClientCommand("ping", Host_Ping_f);
   Cmd_AddCommand("load", Host_Loadgame_f);
   Cmd_AddCommand("save", Host_Savegame_f);
-  Cmd_AddCommand("give", Host_Give_f);
+  Cmd_AddCommand_ClientCommand("give", Host_Give_f);
 
   Cmd_AddCommand("startdemos", Host_Startdemos_f);
   Cmd_AddCommand("demos", Host_Demos_f);

@@ -21,17 +21,23 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
 
+#include "arch_def.h"
 #include "quakedef.h"
 
+#include <sys/types.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#if defined(PLATFORM_OSX) || defined(PLATFORM_HAIKU)
+#include <libgen.h> /* dirname() and basename() */
+#endif
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-#ifdef DO_USERDIRS
+#include <fcntl.h>
+#include <time.h>
+#include <dirent.h>
 #include <pwd.h>
-#endif
+#include <dlfcn.h>
 
 #if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)
 #if defined(USE_SDL2)
@@ -44,11 +50,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #endif
 
 qboolean isDedicated;
-cvar_t sys_throttle = {"sys_throttle", "0.02", CVAR_ARCHIVE};
 
 #define MAX_HANDLES 32 /* johnfitz -- was 10 */
 static FILE *sys_handles[MAX_HANDLES];
 static qboolean stdinIsATTY; /* from ioquake3 source */
+
+static double rcp_counter_freq;
 
 static int findhandle(void) {
   int i;
@@ -61,20 +68,60 @@ static int findhandle(void) {
   return -1;
 }
 
-long Sys_filelength(FILE *f) {
-  long pos, end;
+FILE *Sys_fopen(const char *path, const char *mode) {
+  if (strchr(mode, 'w')) {
+    char dir[MAX_OSPATH];
+    int i, rc;
+    q_strlcpy(dir, path, sizeof(dir));
+    for (i = 1; dir[i]; i++) {
+      if (dir[i] != '/')
+        continue;
+      dir[i] = '\0';
+      rc = mkdir(dir, 0777);
+      if (rc != 0 && errno == EEXIST) {
+        struct stat st;
+        if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
+          rc = 0;
+      }
+      if (rc != 0)
+        return NULL;
+      dir[i] = '/';
+    }
+  }
 
-  pos = ftell(f);
-  fseek(f, 0, SEEK_END);
-  end = ftell(f);
-  fseek(f, pos, SEEK_SET);
+  return fopen(path, mode);
+}
+
+COMPILE_TIME_ASSERT(CHECK_LARGE_FILE_SUPPORT,
+                    sizeof(off_t) >= sizeof(qfileofs_t));
+
+int Sys_fseek(FILE *file, qfileofs_t ofs, int origin) {
+  return fseeko(file, ofs, origin);
+}
+
+qfileofs_t Sys_ftell(FILE *file) { return ftello(file); }
+
+int Sys_remove(const char *path) { return remove(path); }
+
+int Sys_rename(const char *oldname, const char *newname) {
+  return rename(oldname, newname);
+}
+
+qfileofs_t Sys_filelength(FILE *f) {
+  qfileofs_t pos, end;
+
+  pos = Sys_ftell(f);
+  Sys_fseek(f, 0, SEEK_END);
+  end = Sys_ftell(f);
+  Sys_fseek(f, pos, SEEK_SET);
 
   return end;
 }
 
-int Sys_FileOpenRead(const char *path, int *hndl) {
+qfileofs_t Sys_FileOpenRead(const char *path, int *hndl) {
   FILE *f;
-  int i, retval;
+  int i;
+  qfileofs_t retval;
 
   i = findhandle();
   f = fopen(path, "rb");
@@ -96,7 +143,7 @@ int Sys_FileOpenWrite(const char *path) {
   int i;
 
   i = findhandle();
-  f = fopen(path, "wb");
+  f = Sys_fopen(path, "wb");
 
   if (!f)
     Sys_Error("Error opening %s: %s", path, strerror(errno));
@@ -122,6 +169,8 @@ int Sys_FileWrite(int handle, const void *data, int count) {
   return fwrite(data, 1, count, sys_handles[handle]);
 }
 
+qboolean Sys_FileExists(const char *path) { return access(path, F_OK) == 0; }
+
 int Sys_FileType(const char *path) {
   /*
   if (access(path, R_OK) == -1)
@@ -137,6 +186,14 @@ int Sys_FileType(const char *path) {
     return FS_ENT_FILE;
 
   return FS_ENT_NONE;
+}
+
+qboolean Sys_GetFileTime(const char *path, time_t *out) {
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return false;
+  *out = st.st_mtime;
+  return true;
 }
 
 #if defined(__linux__) || defined(__sun) || defined(sun) || defined(_AIX)
@@ -211,16 +268,15 @@ static int Sys_NumCPUs(void) {
 static int Sys_NumCPUs(void) { return -2; }
 #endif
 
+#ifdef PLATFORM_OSX
+#define SYS_USERDIR "Library/Application Support/" ENGINE_USERDIR_OSX
+#else
+#define SYS_USERDIR ENGINE_USERDIR_UNIX
+#endif
+
 static char cwd[MAX_OSPATH];
 #ifdef DO_USERDIRS
 static char userdir[MAX_OSPATH];
-#ifdef PLATFORM_OSX
-#define SYS_USERDIR "Library/Application Support/QuakeSpasm"
-#elif defined(PLATFORM_HAIKU)
-#define SYS_USERDIR "QuakeSpasm"
-#else
-#define SYS_USERDIR ".quakespasm"
-#endif
 
 #ifdef PLATFORM_HAIKU
 #include <FindDirectory.h>
@@ -266,6 +322,99 @@ static void Sys_GetUserdir(char *dst, size_t dstsize) {
 }
 #endif /* PLATFORM_HAIKU */
 #endif /* DO_USERDIRS */
+
+qboolean Sys_GetAltUserPrefDir(qboolean remastered, char *dst, size_t dstsize) {
+  const char *home_dir = NULL;
+  struct passwd *pwent;
+
+  pwent = getpwuid(getuid());
+  if (pwent == NULL)
+    perror("getpwuid");
+  else
+    home_dir = pwent->pw_dir;
+  if (home_dir == NULL)
+    home_dir = getenv("HOME");
+  if (home_dir == NULL)
+    return false;
+
+  if ((size_t)q_snprintf(dst, dstsize, "%s/%s/%s", home_dir, SYS_USERDIR,
+                         remastered ? ".rerelease" : ".original") >= dstsize)
+    return false;
+
+  return true;
+}
+
+static qboolean Sys_Exec(const char *cmd, ...) {
+  pid_t p = fork();
+  if (p < 0) // fork failed
+    return false;
+  else if (p == 0) // child process
+  {
+    va_list argptr;
+    const char *argv[1024];
+    size_t argc;
+    FILE *dummy;
+
+    argv[0] = (char *)cmd;
+    argc = 1;
+
+    va_start(argptr, cmd);
+    for (; argc + 1 < countof(argv); argc++) {
+      const char *cur = va_arg(argptr, const char *);
+      if (!cur)
+        break;
+      argv[argc] = cur;
+    }
+    va_end(argptr);
+    argv[argc++] = NULL;
+
+    // Disable stdout/stderr
+    // Note: using a dummy variable to avoid triggering -Wunused-result
+    dummy = freopen("/dev/null", "w", stdout);
+    (void)dummy;
+    dummy = freopen("/dev/null", "w", stderr);
+    (void)dummy;
+
+    execvp(cmd, (char **)argv);
+
+    exit(EXIT_FAILURE);
+  } else // original process
+  {
+    return true;
+  }
+}
+
+qboolean Sys_Explore(const char *path) {
+  char buf[32768];
+  char *s;
+
+  if (Sys_FileType(path) == FS_ENT_NONE)
+    return false;
+
+  // Try to identify the current desktop so we can open the parent dir in the
+  // file manager *and* select the right file in it
+  s = getenv("XDG_CURRENT_DESKTOP");
+  if (s) {
+    char *cur = NULL;
+    char *desktop = NULL;
+    q_strlcpy(buf, s, sizeof(buf));
+    for (desktop = strtok_r(buf, ":", &cur); desktop;
+         desktop = strtok_r(NULL, ":", &cur)) {
+      if (q_strcasecmp(desktop, "gnome") == 0)
+        return Sys_Exec("nautilus", "--select", path);
+      if (q_strcasecmp(desktop, "kde") == 0)
+        return Sys_Exec("dolphin", "--select", path);
+    }
+  }
+
+  // Fall back to just opening the parent dir without selecting the file
+  q_strlcpy(buf, path, sizeof(buf));
+  s = Q_strrchr(buf, '/');
+  if (!s)
+    return false;
+  s[1] = '\0'; // terminate after the slash
+  return SDL_OpenURL(buf) == 0;
+}
 
 #ifdef PLATFORM_OSX
 static char *OSX_StripAppBundle(
@@ -338,6 +487,97 @@ static void Sys_GetBasedir(char *argv0, char *dst, size_t dstsize) {
 }
 #endif
 
+static char exedir[MAX_OSPATH];
+
+static const char *Sys_GetExeDir(void) {
+  char *argv0 = host_parms->argv[0];
+  char *slash = argv0 ? strrchr(argv0, '/') : NULL;
+  if (!slash || slash - argv0 >= countof(exedir))
+    return NULL;
+
+  memcpy(exedir, argv0, slash - argv0);
+  exedir[slash - argv0] = 0;
+
+  return exedir;
+}
+
+typedef struct unixfindfile_s {
+  findfile_t base;
+  DIR *handle;
+  struct dirent *data;
+  char filter[8];
+} unixfindfile_t;
+
+static void Sys_FillFindData(unixfindfile_t *find) {
+  q_strlcpy(find->base.name, find->data->d_name, sizeof(find->base.name));
+  find->base.attribs = 0;
+  if (find->data->d_type & DT_DIR)
+    find->base.attribs |= FA_DIRECTORY;
+}
+
+static struct dirent *readdir_filtered(DIR *handle, const char *ext) {
+  while (1) {
+    struct dirent *data = readdir(handle);
+    if (!data || ext[0] == '*' ||
+        !strcmp(ext, COM_FileGetExtension(data->d_name)))
+      return data;
+  }
+  return NULL;
+}
+
+findfile_t *Sys_FindFirst(const char *dir, const char *ext) {
+  unixfindfile_t *ret;
+  DIR *handle;
+  struct dirent *data;
+
+  if (!ext)
+    ext = "*";
+  else if (*ext == '.')
+    ++ext;
+
+  if (Q_strlen(ext) >= countof(ret->filter))
+    Sys_Error("Sys_FindFirst: extension too long '%s'", ext);
+
+  handle = opendir(dir);
+  if (!handle)
+    return NULL;
+
+  data = readdir_filtered(handle, ext);
+  if (!data) {
+    closedir(handle);
+    return NULL;
+  }
+
+  ret = (unixfindfile_t *)calloc(1, sizeof(unixfindfile_t));
+  if (!ret)
+    Sys_Error("Sys_FindFirst: out of memory");
+  ret->handle = handle;
+  ret->data = data;
+  q_strlcpy(ret->filter, ext, sizeof(ret->filter));
+  Sys_FillFindData(ret);
+
+  return (findfile_t *)ret;
+}
+
+findfile_t *Sys_FindNext(findfile_t *find) {
+  unixfindfile_t *ufind = (unixfindfile_t *)find;
+  ufind->data = readdir_filtered(ufind->handle, ufind->filter);
+  if (!ufind->data) {
+    Sys_FindClose(find);
+    return NULL;
+  }
+  Sys_FillFindData(ufind);
+  return find;
+}
+
+void Sys_FindClose(findfile_t *find) {
+  if (find) {
+    unixfindfile_t *ufind = (unixfindfile_t *)find;
+    closedir(ufind->handle);
+    free(ufind);
+  }
+}
+
 void Sys_Init(void) {
   const char *term = getenv("TERM");
   stdinIsATTY = isatty(STDIN_FILENO) &&
@@ -346,8 +586,10 @@ void Sys_Init(void) {
     Sys_Printf("Terminal input not available.\n");
 
   memset(cwd, 0, sizeof(cwd));
+  printf("cwd: %s\n", cwd);
   Sys_GetBasedir(host_parms->argv[0], cwd, sizeof(cwd));
   host_parms->basedir = cwd;
+  host_parms->exedir = Sys_GetExeDir();
 #ifndef DO_USERDIRS
   host_parms->userdir =
       host_parms->basedir; /* code elsewhere relies on this ! */
@@ -359,6 +601,8 @@ void Sys_Init(void) {
 #endif
   host_parms->numcpus = Sys_NumCPUs();
   Sys_Printf("Detected %d CPUs.\n", host_parms->numcpus);
+
+  rcp_counter_freq = 1.0 / SDL_GetPerformanceFrequency();
 }
 
 void Sys_mkdir(const char *path) {
@@ -374,10 +618,12 @@ void Sys_mkdir(const char *path) {
   }
 }
 
+qboolean Sys_IsDebuggerPresent(void) { return false; }
+
 static const char errortxt1[] = "\nERROR-OUT BEGIN\n\n";
 static const char errortxt2[] = "\nQUAKE ERROR: ";
 
-void Sys_Error(const char *error, ...) {
+void Sys_ReportError(const char *error, ...) {
   va_list argptr;
   char text[1024];
 
@@ -400,10 +646,18 @@ void Sys_Error(const char *error, ...) {
 
 void Sys_Printf(const char *fmt, ...) {
   va_list argptr;
+  char qtext[1024];
+  char u8text[4096];
 
   va_start(argptr, fmt);
-  vprintf(fmt, argptr);
+  q_vsnprintf(qtext, sizeof(qtext), fmt, argptr);
   va_end(argptr);
+
+  UTF8_FromQuake(u8text, sizeof(u8text), qtext);
+  printf("%s", u8text);
+
+  // log all messages to file as well if -condebug was specified
+  Con_DebugLog(u8text);
 }
 
 void Sys_Quit(void) {
@@ -412,7 +666,9 @@ void Sys_Quit(void) {
   exit(0);
 }
 
-double Sys_DoubleTime(void) { return SDL_GetTicks() / 1000.0; }
+double Sys_DoubleTime(void) {
+  return (double)SDL_GetPerformanceCounter() * rcp_counter_freq;
+}
 
 const char *Sys_ConsoleInput(void) {
   static qboolean con_eof = false;
@@ -474,3 +730,13 @@ void Sys_SendKeyEvents(void) {
                  // confirm SCR_ModalMessage
   IN_SendKeyEvents();
 }
+
+void Sys_ActivateKeyFilter(qboolean active) {}
+
+void *Sys_LoadLibrary(const char *path) { return dlopen(path, RTLD_LAZY); }
+
+void *Sys_GetLibraryFunction(void *lib, const char *func) {
+  return dlsym(lib, func);
+}
+
+void Sys_CloseLibrary(void *lib) { dlclose(lib); }

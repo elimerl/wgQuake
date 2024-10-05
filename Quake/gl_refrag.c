@@ -23,113 +23,66 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 
-static mnode_t *r_pefragtopnode;
+//===========================================================================
+
+extern cvar_t r_oit;
+extern cvar_t r_alphasort;
 
 /*
 ===============================================================================
 
-                                        ENTITY FRAGMENT FUNCTIONS
+					ENTITY FRAGMENT FUNCTIONS
 
 ericw -- GLQuake only uses efrags for static entities, and they're never
 removed, so I trimmed out unused functionality and fields in efrag_t.
 
-Now, efrags are just a linked list for each leaf of the static
-entities that touch that leaf. The efrags are hunk-allocated so there is no
-fixed limit.
-
 This is inspired by MH's tutorial, and code from RMQEngine.
 http://forums.insideqc.com/viewtopic.php?t=1930
-
+ 
 ===============================================================================
 */
 
-static vec3_t r_emins, r_emaxs;
+// leaf count followed by leaf indices, for each static ent with a non-NULL model
+int			*cl_efrags;
 
-static entity_t *r_addent;
-
-#define EXTRA_EFRAGS 128
-
-// based on RMQEngine
-static efrag_t *R_GetEfrag(void) {
-  // we could just Hunk_Alloc a single efrag_t and return it, but since
-  // the struct is so small (2 pointers) allocate groups of them
-  // to avoid wasting too much space on the hunk allocation headers.
-  if (cl.free_efrags) {
-    efrag_t *ef = cl.free_efrags;
-    cl.free_efrags = ef->leafnext;
-    ef->leafnext = NULL;
-
-    cl.num_efrags++;
-
-    return ef;
-  } else {
-    int i;
-
-    cl.free_efrags =
-        (efrag_t *)Hunk_AllocName(EXTRA_EFRAGS * sizeof(efrag_t), "efrags");
-
-    for (i = 0; i < EXTRA_EFRAGS - 1; i++)
-      cl.free_efrags[i].leafnext = &cl.free_efrags[i + 1];
-
-    cl.free_efrags[i].leafnext = NULL;
-
-    // call recursively to get a newly allocated free efrag
-    return R_GetEfrag();
-  }
-}
+vec3_t		r_emins, r_emaxs;
 
 /*
 ===================
 R_SplitEntityOnNode
 ===================
 */
-void R_SplitEntityOnNode(mnode_t *node) {
-  efrag_t *ef;
-  mplane_t *splitplane;
-  mleaf_t *leaf;
-  int sides;
+static void R_SplitEntityOnNode (mnode_t *node)
+{
+	mplane_t	*splitplane;
+	int			idx, sides;
 
-  if (node->contents == CONTENTS_SOLID) {
-    return;
-  }
+	if (node->contents == CONTENTS_SOLID)
+	{
+		return;
+	}
 
-  // add an efrag if the node is a leaf
+// add an efrag if the node is a leaf
 
-  if (node->contents < 0) {
-    if (!r_pefragtopnode)
-      r_pefragtopnode = node;
+	if (node->contents < 0)
+	{
+		idx = (mleaf_t *)node - cl.worldmodel->leafs;
+		if (idx >= 1)
+			VEC_PUSH (cl_efrags, idx - 1);
+		return;
+	}
 
-    leaf = (mleaf_t *)node;
+// NODE_MIXED
 
-    // grab an efrag off the free list
-    ef = R_GetEfrag();
-    ef->entity = r_addent;
+	splitplane = node->plane;
+	sides = BOX_ON_PLANE_SIDE(r_emins, r_emaxs, splitplane);
 
-    // set the leaf links
-    ef->leafnext = leaf->efrags;
-    leaf->efrags = ef;
+// recurse down the contacted sides
+	if (sides & 1)
+		R_SplitEntityOnNode (node->children[0]);
 
-    return;
-  }
-
-  // NODE_MIXED
-
-  splitplane = node->plane;
-  sides = BOX_ON_PLANE_SIDE(r_emins, r_emaxs, splitplane);
-
-  if (sides == 3) {
-    // split on this plane
-    // if this is the first splitter of this bmodel, remember it
-    if (!r_pefragtopnode)
-      r_pefragtopnode = node;
-  }
-
-  // recurse down the contacted sides
-  if (sides & 1)
-    R_SplitEntityOnNode(node->children[0]);
-
-  if (sides & 2)
-    R_SplitEntityOnNode(node->children[1]);
+	if (sides & 2)
+		R_SplitEntityOnNode (node->children[1]);
 }
 
 /*
@@ -137,15 +90,26 @@ void R_SplitEntityOnNode(mnode_t *node) {
 R_CheckEfrags -- johnfitz -- check for excessive efrag count
 ===========
 */
-void R_CheckEfrags(void) {
-  if (cls.signon < 2)
-    return; // don't spam when still parsing signon packet full of static ents
+void R_CheckEfrags (void)
+{
+	if (cls.signon < 2)
+		return; //don't spam when still parsing signon packet full of static ents
 
-  if (cl.num_efrags > 640 && dev_peakstats.efrags <= 640)
-    Con_DWarning("%i efrags exceeds standard limit of 640.\n", cl.num_efrags);
+	if (cl.num_efrags > 640 && dev_peakstats.efrags <= 640)
+		Con_DWarning ("%i efrags exceeds standard limit of 640.\n", cl.num_efrags);
 
-  dev_stats.efrags = cl.num_efrags;
-  dev_peakstats.efrags = q_max(cl.num_efrags, dev_peakstats.efrags);
+	dev_stats.efrags = cl.num_efrags;
+	dev_peakstats.efrags = q_max(cl.num_efrags, dev_peakstats.efrags);
+}
+
+/*
+===========
+R_ClearEfrags
+===========
+*/
+void R_ClearEfrags (void)
+{
+	VEC_CLEAR (cl_efrags);
 }
 
 /*
@@ -153,51 +117,88 @@ void R_CheckEfrags(void) {
 R_AddEfrags
 ===========
 */
-void R_AddEfrags(entity_t *ent) {
-  qmodel_t *entmodel;
-  vec_t scalefactor;
+void R_AddEfrags (entity_t *ent)
+{
+	qmodel_t	*entmodel;
+	vec_t		scalefactor;
+	int			i;
 
-  if (!ent->model)
-    return;
+	if (!ent->model)
+		return;
 
-  r_addent = ent;
+	entmodel = ent->model;
+	scalefactor = ENTSCALE_DECODE(ent->scale);
+	if (scalefactor != 1.0f)
+	{
+		VectorMA (ent->origin, scalefactor, entmodel->mins, r_emins);
+		VectorMA (ent->origin, scalefactor, entmodel->maxs, r_emaxs);
+	}
+	else
+	{
+		VectorAdd (ent->origin, entmodel->mins, r_emins);
+		VectorAdd (ent->origin, entmodel->maxs, r_emaxs);
+	}
 
-  r_pefragtopnode = NULL;
+	i = VEC_SIZE (cl_efrags);
+	VEC_PUSH (cl_efrags, 0); // write dummy count
 
-  entmodel = ent->model;
-  scalefactor = ENTSCALE_DECODE(ent->scale);
-  if (scalefactor != 1.0f) {
-    VectorMA(ent->origin, scalefactor, entmodel->mins, r_emins);
-    VectorMA(ent->origin, scalefactor, entmodel->maxs, r_emaxs);
-  } else {
-    VectorAdd(ent->origin, entmodel->mins, r_emins);
-    VectorAdd(ent->origin, entmodel->maxs, r_emaxs);
-  }
+	R_SplitEntityOnNode (cl.worldmodel->nodes);
+	cl_efrags[i] = VEC_SIZE (cl_efrags) - i - 1; // write actual count
+	cl.num_efrags += cl_efrags[i];
 
-  R_SplitEntityOnNode(cl.worldmodel->nodes);
-
-  ent->topnode = r_pefragtopnode;
-
-  R_CheckEfrags(); // johnfitz
+	R_CheckEfrags (); //johnfitz
 }
 
 /*
-================
-R_StoreEfrags -- johnfitz -- pointless switch statement removed.
-================
+===============
+R_AddStaticModels
+===============
 */
-void R_StoreEfrags(efrag_t **ppefrag) {
-  entity_t *pent;
-  efrag_t *pefrag;
+void R_AddStaticModels (const byte *vis)
+{
+	int			i, j, start, leafidx, maxleaf, numleafs, *efrags;
+	entity_t	*ent;
 
-  while ((pefrag = *ppefrag) != NULL) {
-    pent = pefrag->entity;
+	for (i = maxleaf = 0, start = cl_numvisedicts, ent = cl_static_entities, efrags = cl_efrags; i < cl.num_statics; i++, ent++)
+	{
+		if (!ent->model)
+			continue;
+		for (j = 0, numleafs = *efrags++; j < numleafs; j++)
+		{
+			leafidx = efrags[j];
+			if ((vis[leafidx >> 3] & (1 << (leafidx & 7))))
+			{
+				if (cl_numvisedicts >= MAX_VISEDICTS)
+					return;
+				cl_visedicts[cl_numvisedicts++] = ent;
+				ent->firstleaf = leafidx + 1;
+				maxleaf = q_max (maxleaf, leafidx + 1);
+				break;
+			}
+		}
+		efrags += numleafs;
+	}
 
-    if ((pent->visframe != r_framecount) && (cl_numvisedicts < MAX_VISEDICTS)) {
-      cl_visedicts[cl_numvisedicts++] = pent;
-      pent->visframe = r_framecount;
-    }
+	// reverse order to match QS, if needed
+	if (!r_oit.value && !r_alphasort.value)
+	{
+		int count = cl_numvisedicts - start;
+		int half = count / 2;
+		int shift = 0;
 
-    ppefrag = &pefrag->leafnext;
-  }
+		// make sure we don't overflow the sort key
+		while (maxleaf > MODSORT_BITS)
+		{
+			maxleaf >>= 1;
+			shift++;
+		}
+
+		for (i = 0, j = count - 1; i < half; i++, j--)
+		{
+			ent = cl_visedicts[start + i];
+			cl_visedicts[start + i] = cl_visedicts[start + j];
+			cl_visedicts[start + j] = ent;
+			ent->firstleaf >>= shift;
+		}
+	}
 }

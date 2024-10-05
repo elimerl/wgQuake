@@ -24,296 +24,145 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 
-extern cvar_t gl_fullbrights, r_drawflat, gl_overbright, r_oldwater; // johnfitz
-extern cvar_t gl_zfix; // QuakeSpasm z-fighting fix
+extern cvar_t gl_fullbrights, gl_overbright; //johnfitz
 
-int gl_lightmap_format;
-int lightmap_bytes;
+int		gl_lightmap_format;
+int		lightmap_bytes;
 
-#define MAX_SANITY_LIGHTMAPS (1u << 20)
-struct lightmap_s *lightmaps;
-int lightmap_count;
+typedef struct {
+	qboolean		reverse;
+	int				x, width, height;
+	int				*allocated;
+} chart_t;
 
-static int allocated[LMBLOCK_WIDTH];
-static int last_lightmap_allocated;
+#define MAX_SANITY_LIGHTMAPS (1u<<20)
+lightmap_t		*lightmaps;
+int				lightmap_count;
+int				last_lightmap_allocated;
+chart_t			lightmap_chart;
+msurface_t		**lit_surfs;
+int				*lit_surf_order[2];
+int				num_lightmap_samples;
+unsigned		*lightmap_data;
+gltexture_t		*lightmap_texture;
+int				lightmap_width;
+int				lightmap_height;
 
-static unsigned blocklights[LMBLOCK_WIDTH * LMBLOCK_HEIGHT *
-                            3]; // johnfitz -- was 18*18, added lit support (*3)
-                                // and loosened surface extents maximum
-                                // (LMBLOCK_WIDTH*LMBLOCK_HEIGHT)
 
 /*
 ===============
-R_TextureAnimation -- johnfitz -- added "frame" param to eliminate use of
-"currententity" global
+R_TextureAnimation
 
 Returns the proper texture for a given time and base texture
 ===============
 */
-texture_t *R_TextureAnimation(texture_t *base, int frame) {
-  int relative;
-  int count;
+texture_t *R_TextureAnimation (texture_t *base, int frame)
+{
+	int		relative;
+	int		count;
 
-  if (frame)
-    if (base->alternate_anims)
-      base = base->alternate_anims;
+	if (frame)
+		if (base->alternate_anims)
+			base = base->alternate_anims;
 
-  if (!base->anim_total)
-    return base;
+	if (!base->anim_total)
+		return base;
 
-  relative = (int)(cl.time * 10) % base->anim_total;
+	relative = (int)(cl.time*10) % base->anim_total;
 
-  count = 0;
-  while (base->anim_min > relative || base->anim_max <= relative) {
-    base = base->anim_next;
-    if (!base)
-      Sys_Error("R_TextureAnimation: broken cycle");
-    if (++count > 100)
-      Sys_Error("R_TextureAnimation: infinite cycle");
-  }
+	count = 0;
+	while (base->anim_min > relative || base->anim_max <= relative)
+	{
+		base = base->anim_next;
+		if (!base)
+			Sys_Error ("R_TextureAnimation: broken cycle");
+		if (++count > 100)
+			Sys_Error ("R_TextureAnimation: infinite cycle");
+	}
 
-  return base;
-}
-
-/*
-================
-DrawGLPoly
-================
-*/
-void DrawGLPoly(glpoly_t *p) {
-  float *v;
-  int i;
-
-  glBegin(GL_POLYGON);
-  v = p->verts[0];
-  for (i = 0; i < p->numverts; i++, v += VERTEXSIZE) {
-    glTexCoord2f(v[3], v[4]);
-    glVertex3fv(v);
-  }
-  glEnd();
-}
-
-/*
-================
-DrawGLTriangleFan -- johnfitz -- like DrawGLPoly but for r_showtris
-================
-*/
-void DrawGLTriangleFan(glpoly_t *p) {
-  float *v;
-  int i;
-
-  glBegin(GL_TRIANGLE_FAN);
-  v = p->verts[0];
-  for (i = 0; i < p->numverts; i++, v += VERTEXSIZE) {
-    glVertex3fv(v);
-  }
-  glEnd();
+	return base;
 }
 
 /*
 =============================================================
 
-        BRUSH MODELS
+	LIGHTMAPS
 
 =============================================================
 */
 
 /*
-=================
-R_DrawBrushModel
-=================
+==================
+Chart_Init
+==================
 */
-void R_DrawBrushModel(entity_t *e) {
-  int i, k;
-  msurface_t *psurf;
-  float dot;
-  mplane_t *pplane;
-  qmodel_t *clmodel;
-
-  if (R_CullModelForEntity(e))
-    return;
-
-  currententity = e;
-  clmodel = e->model;
-
-  VectorSubtract(r_refdef.vieworg, e->origin, modelorg);
-  if (e->angles[0] || e->angles[1] || e->angles[2]) {
-    vec3_t temp;
-    vec3_t forward, right, up;
-
-    VectorCopy(modelorg, temp);
-    AngleVectors(e->angles, forward, right, up);
-    modelorg[0] = DotProduct(temp, forward);
-    modelorg[1] = -DotProduct(temp, right);
-    modelorg[2] = DotProduct(temp, up);
-  }
-
-  psurf = &clmodel->surfaces[clmodel->firstmodelsurface];
-
-  // calculate dynamic lighting for bmodel if it's not an
-  // instanced model
-  if (clmodel->firstmodelsurface != 0 && !gl_flashblend.value) {
-    for (k = 0; k < MAX_DLIGHTS; k++) {
-      if ((cl_dlights[k].die < cl.time) || (!cl_dlights[k].radius))
-        continue;
-
-      R_MarkLights(&cl_dlights[k], k,
-                   clmodel->nodes + clmodel->hulls[0].firstclipnode);
-    }
-  }
-
-  glPushMatrix();
-  e->angles[0] = -e->angles[0]; // stupid quake bug
-  if (gl_zfix.value) {
-    e->origin[0] -= DIST_EPSILON;
-    e->origin[1] -= DIST_EPSILON;
-    e->origin[2] -= DIST_EPSILON;
-  }
-  R_RotateForEntity(e->origin, e->angles, e->scale);
-  if (gl_zfix.value) {
-    e->origin[0] += DIST_EPSILON;
-    e->origin[1] += DIST_EPSILON;
-    e->origin[2] += DIST_EPSILON;
-  }
-  e->angles[0] = -e->angles[0]; // stupid quake bug
-
-  R_ClearTextureChains(clmodel, chain_model);
-  for (i = 0; i < clmodel->nummodelsurfaces; i++, psurf++) {
-    pplane = psurf->plane;
-    dot = DotProduct(modelorg, pplane->normal) - pplane->dist;
-    if (((psurf->flags & SURF_PLANEBACK) && (dot < -BACKFACE_EPSILON)) ||
-        (!(psurf->flags & SURF_PLANEBACK) && (dot > BACKFACE_EPSILON))) {
-      R_ChainSurface(psurf, chain_model);
-      R_RenderDynamicLightmaps(psurf);
-      rs_brushpolys++;
-    }
-  }
-
-  R_DrawTextureChains(clmodel, e, chain_model);
-  R_DrawTextureChains_Water(clmodel, e, chain_model);
-
-  glPopMatrix();
+static void Chart_Init (chart_t *chart, int width, int height)
+{
+	if (chart->width != width)
+	{
+		chart->allocated = (int *)realloc (chart->allocated, sizeof (chart->allocated[0]) * width);
+		if (!chart->allocated)
+			Sys_Error ("Chart_Init: could not allocate %" SDL_PRIu64 " bytes", (uint64_t) (sizeof (chart->allocated[0]) * width));
+	}
+	memset (chart->allocated, 0, sizeof (chart->allocated[0]) * width);
+	chart->width = width;
+	chart->height = height;
+	chart->x = 0;
+	chart->reverse = false;
 }
 
 /*
-=================
-R_DrawBrushModel_ShowTris -- johnfitz
-=================
+==================
+Chart_Add
+==================
 */
-void R_DrawBrushModel_ShowTris(entity_t *e) {
-  int i;
-  msurface_t *psurf;
-  float dot;
-  mplane_t *pplane;
-  qmodel_t *clmodel;
-  glpoly_t *p;
+static qboolean Chart_Add (chart_t *chart, int w, int h, short *outx, short *outy)
+{
+	int i, x, y;
+	if (chart->width < w || chart->height < h)
+		Sys_Error ("Chart_Add: block too large %dx%d, max is %dx%d", w, h, chart->width, chart->height);
 
-  if (R_CullModelForEntity(e))
-    return;
+	// advance horizontally, reversing direction at the edges
+	if (chart->reverse)
+	{
+		if (chart->x < w)
+		{
+			chart->x = 0;
+			chart->reverse = false;
+			goto forward;
+		}
+	reverse:
+		x = chart->x - w;
+		chart->x = x;
+	}
+	else
+	{
+		if (chart->x + w > chart->width)
+		{
+			chart->x = chart->width;
+			chart->reverse = true;
+			goto reverse;
+		}
+	forward:
+		x = chart->x;
+		chart->x += w;
+	}
 
-  currententity = e;
-  clmodel = e->model;
+	// find lowest unoccupied vertical position
+	y = 0;
+	for (i = 0; i < w; i++)
+		y = q_max (y, chart->allocated[x + i]);
+	if (y + h > chart->height)
+		return false;
 
-  VectorSubtract(r_refdef.vieworg, e->origin, modelorg);
-  if (e->angles[0] || e->angles[1] || e->angles[2]) {
-    vec3_t temp;
-    vec3_t forward, right, up;
+	// update vertical position for each column
+	for (i = 0; i < w; i++)
+		chart->allocated[x + i] = y + h;
 
-    VectorCopy(modelorg, temp);
-    AngleVectors(e->angles, forward, right, up);
-    modelorg[0] = DotProduct(temp, forward);
-    modelorg[1] = -DotProduct(temp, right);
-    modelorg[2] = DotProduct(temp, up);
-  }
+	*outx = x;
+	*outy = y;
 
-  psurf = &clmodel->surfaces[clmodel->firstmodelsurface];
-
-  glPushMatrix();
-  e->angles[0] = -e->angles[0]; // stupid quake bug
-  R_RotateForEntity(e->origin, e->angles, e->scale);
-  e->angles[0] = -e->angles[0]; // stupid quake bug
-
-  //
-  // draw it
-  //
-  for (i = 0; i < clmodel->nummodelsurfaces; i++, psurf++) {
-    pplane = psurf->plane;
-    dot = DotProduct(modelorg, pplane->normal) - pplane->dist;
-    if (((psurf->flags & SURF_PLANEBACK) && (dot < -BACKFACE_EPSILON)) ||
-        (!(psurf->flags & SURF_PLANEBACK) && (dot > BACKFACE_EPSILON))) {
-      if ((psurf->flags & SURF_DRAWTURB) && r_oldwater.value)
-        for (p = psurf->polys->next; p; p = p->next)
-          DrawGLTriangleFan(p);
-      else
-        DrawGLTriangleFan(psurf->polys);
-    }
-  }
-
-  glPopMatrix();
-}
-
-/*
-=============================================================
-
-        LIGHTMAPS
-
-=============================================================
-*/
-
-/*
-================
-R_RenderDynamicLightmaps
-called during rendering
-================
-*/
-void R_RenderDynamicLightmaps(msurface_t *fa) {
-  byte *base;
-  int maps;
-  glRect_t *theRect;
-  int smax, tmax;
-
-  if (fa->flags & SURF_DRAWTILED) // johnfitz -- not a lightmapped surface
-    return;
-
-  // add to lightmap chain
-  fa->polys->chain = lightmaps[fa->lightmaptexturenum].polys;
-  lightmaps[fa->lightmaptexturenum].polys = fa->polys;
-
-  // check for lightmap modification
-  for (maps = 0; maps < MAXLIGHTMAPS && fa->styles[maps] != 255; maps++)
-    if (d_lightstylevalue[fa->styles[maps]] != fa->cached_light[maps])
-      goto dynamic;
-
-  if (fa->dlightframe == r_framecount // dynamic this frame
-      || fa->cached_dlight)           // dynamic previously
-  {
-  dynamic:
-    if (r_dynamic.value) {
-      struct lightmap_s *lm = &lightmaps[fa->lightmaptexturenum];
-      lm->modified = true;
-      theRect = &lm->rectchange;
-      if (fa->light_t < theRect->t) {
-        if (theRect->h)
-          theRect->h += theRect->t - fa->light_t;
-        theRect->t = fa->light_t;
-      }
-      if (fa->light_s < theRect->l) {
-        if (theRect->w)
-          theRect->w += theRect->l - fa->light_s;
-        theRect->l = fa->light_s;
-      }
-      smax = (fa->extents[0] >> 4) + 1;
-      tmax = (fa->extents[1] >> 4) + 1;
-      if ((theRect->w + theRect->l) < (fa->light_s + smax))
-        theRect->w = (fa->light_s - theRect->l) + smax;
-      if ((theRect->h + theRect->t) < (fa->light_t + tmax))
-        theRect->h = (fa->light_t - theRect->t) + tmax;
-      base = lm->data;
-      base += fa->light_t * LMBLOCK_WIDTH * lightmap_bytes +
-              fa->light_s * lightmap_bytes;
-      R_BuildLightMap(fa, base, LMBLOCK_WIDTH * lightmap_bytes);
-    }
-  }
+	return true;
 }
 
 /*
@@ -321,175 +170,264 @@ void R_RenderDynamicLightmaps(msurface_t *fa) {
 AllocBlock -- returns a texture number and the position inside it
 ========================
 */
-int AllocBlock(int w, int h, int *x, int *y) {
-  int i, j;
-  int best, best2;
-  int texnum;
+static int AllocBlock (int w, int h, short *x, short *y)
+{
+	int		texnum;
 
-  // ericw -- rather than searching starting at lightmap 0 every time,
-  // start at the last lightmap we allocated a surface in.
-  // This makes AllocBlock much faster on large levels (can shave off 3+ seconds
-  // of load time on a level with 180 lightmaps), at a cost of not quite packing
-  // lightmaps as tightly vs. not doing this (uses ~5% more lightmaps)
-  for (texnum = last_lightmap_allocated; texnum < MAX_SANITY_LIGHTMAPS;
-       texnum++) {
-    if (texnum == lightmap_count) {
-      lightmap_count++;
-      lightmaps = (struct lightmap_s *)realloc(lightmaps, sizeof(*lightmaps) *
-                                                              lightmap_count);
-      memset(&lightmaps[texnum], 0, sizeof(lightmaps[texnum]));
-      lightmaps[texnum].data =
-          (byte *)calloc(1, 4 * LMBLOCK_WIDTH * LMBLOCK_HEIGHT);
-      // as we're only tracking one texture, we don't need multiple copies of
-      // allocated any more.
-      memset(allocated, 0, sizeof(allocated));
-    }
-    best = LMBLOCK_HEIGHT;
+	// ericw -- rather than searching starting at lightmap 0 every time,
+	// start at the last lightmap we allocated a surface in.
+	// This makes AllocBlock much faster on large levels (can shave off 3+ seconds
+	// of load time on a level with 180 lightmaps), at a cost of not quite packing
+	// lightmaps as tightly vs. not doing this (uses ~5% more lightmaps)
+	for (texnum=last_lightmap_allocated ; texnum<MAX_SANITY_LIGHTMAPS ; texnum++)
+	{
+		if (texnum == lightmap_count)
+		{
+			lightmap_count++;
+			lightmaps = (lightmap_t *) realloc(lightmaps, sizeof(*lightmaps)*lightmap_count);
+			memset(&lightmaps[texnum], 0, sizeof(lightmaps[texnum]));
+			// as we're only tracking one texture, we don't need multiple copies any more.
+			Chart_Init (&lightmap_chart, LMBLOCK_WIDTH, LMBLOCK_HEIGHT);
+			// reserve 1 texel for unlit water surfaces in maps with lit water
+			if (lightmap_count == 1)
+			{
+				lightmap_chart.x = 1;
+				lightmap_chart.allocated[0] = 1;
+			}
+		}
 
-    for (i = 0; i < LMBLOCK_WIDTH - w; i++) {
-      best2 = 0;
+		if (!Chart_Add (&lightmap_chart, w, h, x, y))
+			continue;
 
-      for (j = 0; j < w; j++) {
-        if (allocated[i + j] >= best)
-          break;
-        if (allocated[i + j] > best2)
-          best2 = allocated[i + j];
-      }
-      if (j == w) { // this is a valid spot
-        *x = i;
-        *y = best = best2;
-      }
-    }
+		last_lightmap_allocated = texnum;
+		return texnum;
+	}
 
-    if (best + h > LMBLOCK_HEIGHT)
-      continue;
-
-    for (i = 0; i < w; i++)
-      allocated[*x + i] = best + h;
-
-    last_lightmap_allocated = texnum;
-    return texnum;
-  }
-
-  Sys_Error("AllocBlock: full");
-  return 0; // johnfitz -- shut up compiler
-}
-
-static mvertex_t *r_pcurrentvertbase;
-static qmodel_t *currentmodel;
-
-/*
-========================
-GL_CreateSurfaceLightmap
-========================
-*/
-void GL_CreateSurfaceLightmap(msurface_t *surf) {
-  int smax, tmax;
-  byte *base;
-
-  if (surf->flags & SURF_DRAWTILED) {
-    surf->lightmaptexturenum = -1;
-    return;
-  }
-
-  smax = (surf->extents[0] >> 4) + 1;
-  tmax = (surf->extents[1] >> 4) + 1;
-
-  surf->lightmaptexturenum =
-      AllocBlock(smax, tmax, &surf->light_s, &surf->light_t);
-  base = lightmaps[surf->lightmaptexturenum].data;
-  base += (surf->light_t * LMBLOCK_WIDTH + surf->light_s) * lightmap_bytes;
-  R_BuildLightMap(surf, base, LMBLOCK_WIDTH * lightmap_bytes);
+	Sys_Error ("AllocBlock: full");
+	return 0; //johnfitz -- shut up compiler
 }
 
 /*
-================
-BuildSurfaceDisplayList -- called at level load time
-================
+========================
+GL_NumLightmapTaps
+========================
 */
-void BuildSurfaceDisplayList(msurface_t *fa) {
-  int i, lindex, lnumverts;
-  medge_t *pedges, *r_pedge;
-  float *vec;
-  float s, t, s0, t0, sdiv, tdiv;
-  glpoly_t *poly;
+static int GL_NumLightmapTaps (const msurface_t *surf)
+{
+	if (surf->styles[1] == 255)
+		return 1;
+	if (surf->styles[2] == 255)
+		return 2;
+	return 3;
+}
 
-  // reconstruct the polygon
-  pedges = currentmodel->edges;
-  lnumverts = fa->numedges;
+/*
+========================
+GL_FillSurfaceLightmap
+========================
+*/
+static void GL_FillSurfaceLightmap (msurface_t *surf)
+{
+	lightmap_t	*lm;
+	int			smax, tmax;
+	int			xofs, yofs;
+	int			map;
+	byte		*src;
+	unsigned	*dst;
+	int			s, t, facesize;
 
-  //
-  // draw texture
-  //
-  poly = (glpoly_t *)Hunk_Alloc(sizeof(glpoly_t) +
-                                (lnumverts - 4) * VERTEXSIZE * sizeof(float));
-  poly->next = fa->polys;
-  fa->polys = poly;
-  poly->numverts = lnumverts;
+	if (!cl.worldmodel->lightdata || !surf->samples || surf->styles[0] == 255)
+		return;
 
-  if (fa->flags & SURF_DRAWTURB) {
-    // match Mod_PolyForUnlitSurface
-    s0 = t0 = 0.f;
-    sdiv = tdiv = 128.f;
-  } else {
-    s0 = fa->texinfo->vecs[0][3];
-    t0 = fa->texinfo->vecs[1][3];
-    sdiv = fa->texinfo->texture->width;
-    tdiv = fa->texinfo->texture->height;
-  }
+	lm = &lightmaps[surf->lightmaptexturenum];
+	smax = (surf->extents[0]>>4)+1;
+	tmax = (surf->extents[1]>>4)+1;
+	xofs = lm->xofs + surf->light_s;
+	yofs = lm->yofs + surf->light_t;
+	facesize = smax * tmax * 3;
 
-  for (i = 0; i < lnumverts; i++) {
-    lindex = currentmodel->surfedges[fa->firstedge + i];
+	src = surf->samples;
+	dst = lightmap_data + yofs * lightmap_width + xofs;
 
-    if (lindex > 0) {
-      r_pedge = &pedges[lindex];
-      vec = r_pcurrentvertbase[r_pedge->v[0]].position;
-    } else {
-      r_pedge = &pedges[-lindex];
-      vec = r_pcurrentvertbase[r_pedge->v[1]].position;
-    }
-    s = DotProduct(vec, fa->texinfo->vecs[0]) + s0;
-    s /= sdiv;
+	if (surf->styles[1] == 255) // single lightstyle
+	{
+		for (t = 0; t < tmax; t++, dst += lightmap_width)
+			for (s = 0; s < smax; s++, src += 3)
+				dst[s] = src[0] | (src[1] << 8) | (src[2] << 16) | 0xff000000u;
+	}
+	else if (surf->styles[2] == 255) // 2 lightstyles
+	{
+		for (t = 0; t < tmax; t++, dst += lightmap_width)
+		{
+			for (s = 0; s < smax; s++, src += 3)
+			{
+				dst[s       ] = src[0           ] | (src[1           ] << 8) | (src[2           ] << 16) | 0xff000000u;
+				dst[s + smax] = src[0 + facesize] | (src[1 + facesize] << 8) | (src[2 + facesize] << 16) | 0xff000000u;
+			}
+		}
+	}
+	else // 3 or 4 lightstyles
+	{
+		for (t = 0; t < tmax; t++, dst += lightmap_width)
+		{
+			for (s = 0; s < smax; s++, src += 3)
+			{
+				const byte *mapsrc = src;
+				unsigned r = 0, g = 0, b = 0;
+				for (map = 0; map < 4 && surf->styles[map] != 255; map++, mapsrc += facesize)
+				{
+					r |= mapsrc[0] << (map << 3);
+					g |= mapsrc[1] << (map << 3);
+					b |= mapsrc[2] << (map << 3);
+				}
+				dst[s           ] = r;
+				dst[s + smax    ] = g;
+				dst[s + smax * 2] = b;
+			}
+		}
+	}
+}
 
-    t = DotProduct(vec, fa->texinfo->vecs[1]) + t0;
-    t /= tdiv;
+/*
+==================
+GL_FreeLightmapData
+==================
+*/
+static void GL_FreeLightmapData (void)
+{
+	if (lightmap_data)
+	{
+		free (lightmap_data);
+		lightmap_data = NULL;
+	}
+	if (lightmaps)
+	{
+		free (lightmaps);
+		lightmaps = NULL;
+	}
 
-    VectorCopy(vec, poly->verts[i]);
-    poly->verts[i][3] = s;
-    poly->verts[i][4] = t;
+	VEC_CLEAR (lit_surfs);
 
-    // Q64 RERELEASE texture shift
-    if (fa->texinfo->texture->shift > 0) {
-      poly->verts[i][3] /= (2 * fa->texinfo->texture->shift);
-      poly->verts[i][4] /= (2 * fa->texinfo->texture->shift);
-    }
+	lightmap_texture = NULL; // freed by the texture manager
+	last_lightmap_allocated = 0;
+	lightmap_count = 0;
+	lightmap_width = 0;
+	lightmap_height = 0;
+	num_lightmap_samples = 0;
+}
 
-    //
-    // lightmap texture coordinates
-    //
-    s = DotProduct(vec, fa->texinfo->vecs[0]) + fa->texinfo->vecs[0][3];
-    s -= fa->texturemins[0];
-    s += fa->light_s * 16;
-    s += 8;
-    s /= LMBLOCK_WIDTH * 16; // fa->texinfo->texture->width;
+/*
+==================
+GL_PackLitSurfaces
+==================
+*/
+static void GL_PackLitSurfaces (void)
+{
+	int			i, j, k, pass, bins[256];
+	int			maxblack[2] = {0, 0};
+	short		blackofs[2];
+	int			blacklm;
+	msurface_t *surf;
 
-    t = DotProduct(vec, fa->texinfo->vecs[1]) + fa->texinfo->vecs[1][3];
-    t -= fa->texturemins[1];
-    t += fa->light_t * 16;
-    t += 8;
-    t /= LMBLOCK_HEIGHT * 16; // fa->texinfo->texture->height;
+	// generate surface list
+	for (j=1 ; j<MAX_MODELS ; j++)
+	{
+		qmodel_t *m = cl.model_precache[j];
+		if (!m)
+			break;
+		if (m->name[0] == '*')
+			continue;
+		for (i=0, surf=m->surfaces ; i<m->numsurfaces ; i++, surf++)
+		{
+			int w, h;
+			if (surf->flags & SURF_DRAWTILED)
+				continue;
 
-    poly->verts[i][5] = s;
-    poly->verts[i][6] = t;
-  }
+			w = (surf->extents[0]>>4)+1;
+			h = (surf->extents[1]>>4)+1;
+			if (!surf->samples)
+			{
+				maxblack[0] = q_max (maxblack[0], w);
+				maxblack[1] = q_max (maxblack[1], h);
+			}
+			w *= GL_NumLightmapTaps (surf);
+			w = q_min (w, 255);
 
-  // johnfitz -- removed gl_keeptjunctions code
+			// use light_s temporarily as a sort key
+			surf->light_s = Interleave (w, h) ^ 0xffffu;
+			VEC_PUSH (lit_surfs, surf);
+		}
+	}
 
-  poly->numverts = lnumverts;
+	blacklm = AllocBlock (maxblack[0]+1, maxblack[1]+1, &blackofs[0], &blackofs[1]);
 
-  // support r_oldwater 1 on lit water
-  if (fa->flags & SURF_DRAWTURB)
-    GL_SubdivideSurface(fa);
+	if (VEC_SIZE (lit_surfs) == 0)
+		return;
+
+	lit_surf_order[0] = (int *) realloc (lit_surf_order[0], sizeof (lit_surf_order[0][0]) * VEC_SIZE (lit_surfs));
+	lit_surf_order[1] = (int *) realloc (lit_surf_order[1], sizeof (lit_surf_order[1][0]) * VEC_SIZE (lit_surfs));
+
+	if (!lit_surf_order[0] || !lit_surf_order[1])
+		Sys_Error ("GL_PackLitSurfaces: out of memory (%" SDL_PRIu64 " surfs)", (uint64_t) VEC_SIZE (lit_surfs));
+
+	for (i = 0, j = VEC_SIZE (lit_surfs); i < j; i++)
+		lit_surf_order[0][i] = i;
+
+	// generate surface order (radix sort: 2 passes x 8-bits)
+	for (pass = 0; pass < 2; pass++)
+	{
+		memset (bins, 0, sizeof (bins));
+
+		// count keys
+		for (i = 0, j = VEC_SIZE (lit_surfs); i < j; i++)
+		{
+			int idx = lit_surf_order[pass][i];
+			surf = lit_surfs[idx];
+			k = surf->light_s & 255;
+			++bins[k];
+		}
+
+		// generate offsets (prefix sum)
+		for (i = 0, j = 0; i < countof(bins); i++)
+		{
+			int tmp = bins[i];
+			bins[i] = j;
+			j += tmp;
+		}
+
+		// reorder
+		for (i = 0, j = VEC_SIZE (lit_surfs); i < j; i++)
+		{
+			int idx = lit_surf_order[pass][i];
+			surf = lit_surfs[idx];
+			k = surf->light_s & 255;
+			surf->light_s >>= 8;
+			lit_surf_order[pass ^ 1][bins[k]++] = idx;
+		}
+	}
+
+	// pack surfaces in sort order
+	for (i = 0, j = VEC_SIZE (lit_surfs); i < j; i++)
+	{
+		int smax, tmax;
+
+		surf = lit_surfs[lit_surf_order[0][i]];
+		smax = (surf->extents[0]>>4)+1;
+		tmax = (surf->extents[1]>>4)+1;
+		smax *= GL_NumLightmapTaps (surf);
+		num_lightmap_samples += smax * tmax;
+
+		if (surf->samples)
+		{
+			surf->lightmaptexturenum = AllocBlock (smax, tmax, &surf->light_s, &surf->light_t);
+		}
+		else
+		{
+			surf->lightmaptexturenum = blacklm;
+			surf->light_s = blackofs[0];
+			surf->light_t = blackofs[1];
+		}
+	}
 }
 
 /*
@@ -500,103 +438,135 @@ Builds the lightmap texture
 with all the surfaces from all brush models
 ==================
 */
-void GL_BuildLightmaps(void) {
-  char name[24];
-  int i, j;
-  struct lightmap_s *lm;
-  qmodel_t *m;
+void GL_BuildLightmaps (void)
+{
+	int			i, j, xblocks, yblocks, lmsize;
+	lightmap_t	*lm;
 
-  r_framecount = 1; // no dlightcache
+	r_framecount = 1; // no dlightcache
 
-  // Spike -- wipe out all the lightmap data (johnfitz -- the gltexture objects
-  // were already freed by Mod_ClearAll)
-  for (i = 0; i < lightmap_count; i++)
-    free(lightmaps[i].data);
-  free(lightmaps);
-  lightmaps = NULL;
-  last_lightmap_allocated = 0;
-  lightmap_count = 0;
+	//Spike -- wipe out all the lightmap data (johnfitz -- the gltexture objects were already freed by Mod_ClearAll)
+	GL_FreeLightmapData ();
 
-  gl_lightmap_format = GL_RGBA; // FIXME: hardcoded for now!
+	gl_lightmap_format = GL_RGBA;//FIXME: hardcoded for now!
 
-  switch (gl_lightmap_format) {
-  case GL_RGBA:
-    lightmap_bytes = 4;
-    break;
-  case GL_BGRA:
-    lightmap_bytes = 4;
-    break;
-  default:
-    Sys_Error("GL_BuildLightmaps: bad lightmap format");
-  }
+	switch (gl_lightmap_format)
+	{
+	case GL_RGBA:
+		lightmap_bytes = 4;
+		break;
+	case GL_BGRA:
+		lightmap_bytes = 4;
+		break;
+	default:
+		Sys_Error ("GL_BuildLightmaps: bad lightmap format");
+	}
 
-  for (j = 1; j < MAX_MODELS; j++) {
-    m = cl.model_precache[j];
-    if (!m)
-      break;
-    if (m->name[0] == '*')
-      continue;
-    r_pcurrentvertbase = m->vertexes;
-    currentmodel = m;
-    for (i = 0; i < m->numsurfaces; i++) {
-      // johnfitz -- rewritten to use SURF_DRAWTILED instead of the sky/water
-      // flags
-      if (m->surfaces[i].flags & SURF_DRAWTILED)
-        continue;
-      GL_CreateSurfaceLightmap(m->surfaces + i);
-      BuildSurfaceDisplayList(m->surfaces + i);
-      // johnfitz
-    }
-  }
+	// allocate lightmap blocks
+	GL_PackLitSurfaces ();
 
-  //
-  // upload all lightmaps that were filled
-  //
-  for (i = 0; i < lightmap_count; i++) {
-    lm = &lightmaps[i];
-    lm->modified = false;
-    lm->rectchange.l = LMBLOCK_WIDTH;
-    lm->rectchange.t = LMBLOCK_HEIGHT;
-    lm->rectchange.w = 0;
-    lm->rectchange.h = 0;
+	// determine combined texture size and allocate memory for it
+	xblocks = (int) ceil (sqrt (lightmap_count));
+	yblocks = (lightmap_count + xblocks - 1) / xblocks;
+	lightmap_width = xblocks * LMBLOCK_WIDTH;
+	lightmap_height = yblocks * LMBLOCK_HEIGHT;
+	lmsize = lightmap_width * lightmap_height;
+	if (q_max(lightmap_width, lightmap_height) > gl_max_texture_size)
+	{
+		// dimensions get zero-ed out in GL_FreeLightmapData, save them for the error message
+		int w = lightmap_width;
+		int h = lightmap_height;
+		GL_FreeLightmapData ();
+		Host_Error ("Lightmap texture overflow: needed %dx%d, max is %dx%d\n", w, h, gl_max_texture_size, gl_max_texture_size);
+	}
 
-    // johnfitz -- use texture manager
-    sprintf(name, "lightmap%07i", i);
-    lm->texture =
-        TexMgr_LoadImage(cl.worldmodel, name, LMBLOCK_WIDTH, LMBLOCK_HEIGHT,
-                         SRC_LIGHTMAP, lm->data, "", (src_offset_t)lm->data,
-                         TEXPREF_LINEAR | TEXPREF_NOPICMIP);
-    // johnfitz
-  }
+	Con_DPrintf (
+		"Lightmap size:   %d x %d (%d/%d blocks)\n"
+		"Lightmap memory: %.1lf MB (%.1lf%% efficiency)\n",
+		lightmap_width, lightmap_height, lightmap_count, xblocks * yblocks,
+		(lightmap_bytes * lmsize) / (float)0x100000, 100.0 * num_lightmap_samples / lmsize
+	);
 
-  // johnfitz -- warn about exceeding old limits
-  // GLQuake limit was 64 textures of 128x128. Estimate how many 128x128
-  // textures we would need given that we are using lightmap_count of
-  // LMBLOCK_WIDTH x LMBLOCK_HEIGHT
-  i = lightmap_count * ((LMBLOCK_WIDTH / 128) * (LMBLOCK_HEIGHT / 128));
-  if (i > 64)
-    Con_DWarning("%i lightmaps exceeds standard limit of 64.\n", i);
-  // johnfitz
+	lightmap_data = (unsigned *) calloc (lmsize, sizeof (*lightmap_data));
+	if (!lightmap_data)
+		Sys_Error ("GL_BuildLightmaps: out of memory on %" SDL_PRIu64 " bytes", (uint64_t)(lmsize * sizeof (*lightmap_data)));
+
+	// compute offsets for each lightmap block
+	for (i=0; i<lightmap_count; i++)
+	{
+		lm = &lightmaps[i];
+		lm->xofs = (i % xblocks) * LMBLOCK_WIDTH;
+		lm->yofs = (i / xblocks) * LMBLOCK_HEIGHT;
+	}
+
+	// fill reserved texel
+	lightmap_data[0] = 0xff808080u;
+
+	// unlit map? fill with 50% grey
+	if (!cl.worldmodel->lightdata)
+		for (i = 1; i < lmsize; i++)
+			lightmap_data[i] = 0xff808080u;
+
+	// fill lightmap samples
+	for (i = 0, j = VEC_SIZE (lit_surfs); i < j; i++)
+		GL_FillSurfaceLightmap (lit_surfs[i]);
+
+	lightmap_texture =
+		TexMgr_LoadImage (cl.worldmodel, "lightmap", lightmap_width, lightmap_height,
+			SRC_LIGHTMAP, (byte *)lightmap_data, "", (src_offset_t)lightmap_data,
+			TEXPREF_ALPHA | TEXPREF_LINEAR | TEXPREF_NOPICMIP
+		);
+
+	//johnfitz -- warn about exceeding old limits
+	//GLQuake limit was 64 textures of 128x128. Estimate how many 128x128 textures we would need
+	//given that we are using lightmap_count of LMBLOCK_WIDTH x LMBLOCK_HEIGHT
+	i = lightmap_count * ((LMBLOCK_WIDTH / 128) * (LMBLOCK_HEIGHT / 128));
+	if (i > 64)
+		Con_DWarning("%i lightmaps exceeds standard limit of 64.\n",i);
+	//johnfitz
 }
 
 /*
 =============================================================
 
-        VBO support
+	VBO support
 
 =============================================================
 */
 
 GLuint gl_bmodel_vbo = 0;
+size_t gl_bmodel_vbo_size = 0;
 
-void GL_DeleteBModelVertexBuffer(void) {
-  if (!(gl_vbo_able && gl_mtexable && gl_max_texture_units >= 3))
-    return;
+GLuint gl_bmodel_ibo = 0;
+size_t gl_bmodel_ibo_size = 0;
+GLuint gl_bmodel_indirect_buffer = 0;
+size_t gl_bmodel_indirect_buffer_size = 0;
+GLuint gl_bmodel_leaf_buffer = 0;
+GLuint gl_bmodel_surf_buffer = 0;
+GLuint gl_bmodel_marksurf_buffer = 0;
 
-  GL_DeleteBuffersFunc(1, &gl_bmodel_vbo);
-  gl_bmodel_vbo = 0;
-
-  GL_ClearBufferBindings();
+/*
+==================
+GL_DeleteBModelBuffers
+==================
+*/
+void GL_DeleteBModelBuffers (void)
+{
+	GL_DeleteBuffer (gl_bmodel_vbo);
+	GL_DeleteBuffer (gl_bmodel_ibo);
+	GL_DeleteBuffer (gl_bmodel_indirect_buffer);
+	GL_DeleteBuffer (gl_bmodel_leaf_buffer);
+	GL_DeleteBuffer (gl_bmodel_surf_buffer);
+	GL_DeleteBuffer (gl_bmodel_marksurf_buffer);
+	gl_bmodel_vbo = 0;
+	gl_bmodel_vbo_size = 0;
+	gl_bmodel_ibo = 0;
+	gl_bmodel_ibo_size = 0;
+	gl_bmodel_indirect_buffer = 0;
+	gl_bmodel_indirect_buffer_size = 0;
+	gl_bmodel_leaf_buffer = 0;
+	gl_bmodel_surf_buffer = 0;
+	gl_bmodel_marksurf_buffer = 0;
 }
 
 /*
@@ -607,358 +577,325 @@ Deletes gl_bmodel_vbo if it already exists, then rebuilds it with all
 surfaces from world + all brush models
 ==================
 */
-void GL_BuildBModelVertexBuffer(void) {
-  unsigned int numverts, varray_bytes, varray_index;
-  int i, j;
-  qmodel_t *m;
-  float *varray;
+void GL_BuildBModelVertexBuffer (void)
+{
+	unsigned int	numverts, varray_bytes, varray_index;
+	int			i, j, k;
+	qmodel_t	*m;
+	glvert_t	*varray;
+	float		lmscalex = 1.f / 16.f / lightmap_width;
+	float		lmscaley = 1.f / 16.f / lightmap_height;
 
-  if (!(gl_vbo_able && gl_mtexable && gl_max_texture_units >= 3))
-    return;
+// ask GL for a name for our VBO
+	GL_DeleteBuffer (gl_bmodel_vbo);
+	
+// count all verts in all models
+	numverts = 0;
+	for (j=1 ; j<MAX_MODELS ; j++)
+	{
+		m = cl.model_precache[j];
+		if (!m || m->name[0] == '*' || m->type != mod_brush)
+			continue;
 
-  // ask GL for a name for our VBO
-  GL_DeleteBuffersFunc(1, &gl_bmodel_vbo);
-  GL_GenBuffersFunc(1, &gl_bmodel_vbo);
+		for (i=0 ; i<m->numsurfaces ; i++)
+		{
+			numverts += m->surfaces[i].numedges;
+		}
+	}
+	
+// build vertex array
+	varray_bytes = sizeof (glvert_t) * numverts;
+	varray = (glvert_t *) malloc (varray_bytes);
+	if (!varray)
+		Sys_Error ("GL_BuildBModelVertexBuffer: out of memory on %u bytes", varray_bytes);
+	varray_index = 0;
+	
+	for (j=1 ; j<MAX_MODELS ; j++)
+	{
+		m = cl.model_precache[j];
+		if (!m || m->name[0] == '*' || m->type != mod_brush)
+			continue;
 
-  // count all verts in all models
-  numverts = 0;
-  for (j = 1; j < MAX_MODELS; j++) {
-    m = cl.model_precache[j];
-    if (!m || m->name[0] == '*' || m->type != mod_brush)
-      continue;
+		for (i = 0; i < m->numsurfaces; i++)
+		{
+			msurface_t	*fa = &m->surfaces[i];
+			texture_t	*texture = m->textures[fa->texinfo->texnum];
+			glvert_t	*vert = &varray[varray_index];
+			float		texscalex, texscaley, useofs, lmofs;
+			medge_t		*r_pedge;
+			lightmap_t	*lm;
 
-    for (i = 0; i < m->numsurfaces; i++) {
-      numverts += m->surfaces[i].numedges;
-    }
-  }
+			if (fa->flags & SURF_DRAWTILED)
+			{
+				// match old Mod_PolyForUnlitSurface
+				if (fa->flags & (SURF_DRAWTURB | SURF_DRAWSKY))
+					texscalex = 1.f / 128.f; //warp animation repeats every 128
+				else
+					texscalex = 1.f / 32.f; //to match r_notexture_mip
+				texscaley = texscalex;
+				useofs = 0.f; //unlit surfaces don't use the texture offset
+				lmofs = 0.f;
+				lm = NULL;
+			}
+			else
+			{
+				if (fa->flags & SURF_DRAWTURB)
+				{
+					texscaley = texscalex = 1.f / 128.f; //warp animation repeats every 128
+					useofs = 0.f;
+				}
+				else
+				{
+					texscalex = 1.f / texture->width;
+					texscaley = 1.f / texture->height;
+					useofs = 1.f;
+				}
+				lm = &lightmaps[fa->lightmaptexturenum];
+				lmofs = ((fa->extents[0]>>4)+1) / (float)lightmap_width;
+			}
 
-  // build vertex array
-  varray_bytes = VERTEXSIZE * sizeof(float) * numverts;
-  varray = (float *)malloc(varray_bytes);
-  varray_index = 0;
+			fa->vbo_firstvert = varray_index;
+			varray_index += fa->numedges;
 
-  for (j = 1; j < MAX_MODELS; j++) {
-    m = cl.model_precache[j];
-    if (!m || m->name[0] == '*' || m->type != mod_brush)
-      continue;
+			for (k = 0; k < fa->numedges; k++, vert++)
+			{
+				float	*vec;
+				float	s, t;
+				int		lindex;
 
-    for (i = 0; i < m->numsurfaces; i++) {
-      msurface_t *s = &m->surfaces[i];
-      s->vbo_firstvert = varray_index;
-      memcpy(&varray[VERTEXSIZE * varray_index], s->polys->verts,
-             VERTEXSIZE * sizeof(float) * s->numedges);
-      varray_index += s->numedges;
-    }
-  }
+				lindex = m->surfedges[fa->firstedge + k];
+				if (lindex > 0)
+				{
+					r_pedge = &m->edges[lindex];
+					vec = m->vertexes[r_pedge->v[0]].position;
+				}
+				else
+				{
+					r_pedge = &m->edges[-lindex];
+					vec = m->vertexes[r_pedge->v[1]].position;
+				}
 
-  // upload to GPU
-  GL_BindBufferFunc(GL_ARRAY_BUFFER, gl_bmodel_vbo);
-  GL_BufferDataFunc(GL_ARRAY_BUFFER, varray_bytes, varray, GL_STATIC_DRAW);
-  free(varray);
+				s = DotProduct (vec, fa->texinfo->vecs[0]) + fa->texinfo->vecs[0][3] * useofs;
+				s *= texscalex;
 
-  // invalidate the cached bindings
-  GL_ClearBufferBindings();
+				t = DotProduct (vec, fa->texinfo->vecs[1]) + fa->texinfo->vecs[1][3] * useofs;
+				t *= texscaley;
+
+				VectorCopy (vec, vert->pos);
+				vert->st[0] = s;
+				vert->st[1] = t;
+
+				if (!(fa->flags & SURF_DRAWTILED))
+				{
+					// match old BuildSurfaceDisplayList
+
+					// Q64 RERELEASE texture shift
+					if (texture->shift > 0)
+					{
+						vert->st[0] /= (2 * texture->shift);
+						vert->st[1] /= (2 * texture->shift);
+					}
+
+					//
+					// lightmap texture coordinates
+					//
+					s = DotProduct (vec, fa->texinfo->vecs[0]) + fa->texinfo->vecs[0][3];
+					s -= fa->texturemins[0];
+					s += (fa->light_s + lm->xofs) * 16;
+					s += 8;
+					s *= lmscalex;
+
+					t = DotProduct (vec, fa->texinfo->vecs[1]) + fa->texinfo->vecs[1][3];
+					t -= fa->texturemins[1];
+					t += (fa->light_t + lm->yofs) * 16;
+					t += 8;
+					t *= lmscaley;
+
+					vert->st[2] = s;
+					vert->st[3] = t;
+					vert->lmofs = lmofs;
+					vert->styles = fa->styles[0] | (fa->styles[1] << 8) | (fa->styles[2] << 16) | (fa->styles[3] << 24);
+				}
+				else
+				{
+					// first lightmap texel is fullbright
+					vert->st[2] = 0.5f / lightmap_width;
+					vert->st[3] = 0.5f / lightmap_height;
+					vert->lmofs = 0.f;
+					vert->styles = ~0u;
+				}
+			}
+		}
+	}
+
+// upload to GPU
+	gl_bmodel_vbo_size = varray_bytes;
+	gl_bmodel_vbo = GL_CreateBuffer (GL_ARRAY_BUFFER, GL_STATIC_DRAW, "brushverts", varray_bytes, varray);
+	free (varray);
 }
 
 /*
 ===============
-R_AddDynamicLights
+GL_BuildBModelMarkBuffers
 ===============
 */
-void R_AddDynamicLights(msurface_t *surf) {
-  int lnum;
-  int sd, td;
-  float dist, rad, minlight;
-  vec3_t impact, local;
-  int s, t;
-  int i;
-  int smax, tmax;
-  mtexinfo_t *tex;
-  // johnfitz -- lit support via lordhavoc
-  float cred, cgreen, cblue, brightness;
-  unsigned *bl;
-  // johnfitz
+void GL_BuildBModelMarkBuffers (void)
+{
+	int			i, j, k, sum;
+	int			numtex = 0, numtris = 0, maxnumtex = 0;
+	int			*texidx = NULL;
+	GLuint		*idx;
+	bmodel_draw_indirect_t *cmds;
+	bmodel_gpu_leaf_t *leafs;
+	bmodel_gpu_surf_t *surfs;
 
-  smax = (surf->extents[0] >> 4) + 1;
-  tmax = (surf->extents[1] >> 4) + 1;
-  tex = surf->texinfo;
+	if (!cl.worldmodel)
+		return;
 
-  for (lnum = 0; lnum < MAX_DLIGHTS; lnum++) {
-    if (!(surf->dlightbits[lnum >> 5] & (1U << (lnum & 31))))
-      continue; // not lit by this light
+	// count bmodel textures and triangles
+	for (j = 1 ; j < MAX_MODELS; j++)
+	{
+		qmodel_t *m = cl.model_precache[j];
+		if (!m || m->type != mod_brush)
+			continue;
+		m->firstcmd = numtex;
+		numtex += m->texofs[TEXTYPE_COUNT];
+		maxnumtex = q_max (maxnumtex, m->numtextures);
+		for (i = 0; i < m->nummodelsurfaces; i++)
+			numtris += q_max (m->surfaces[i + m->firstmodelsurface].numedges, 2) - 2;
+	}
 
-    rad = cl_dlights[lnum].radius;
-    dist = DotProduct(cl_dlights[lnum].origin, surf->plane->normal) -
-           surf->plane->dist;
-    rad -= fabs(dist);
-    minlight = cl_dlights[lnum].minlight;
-    if (rad < minlight)
-      continue;
-    minlight = rad - minlight;
+	// allocate cpu-side buffers
+	gl_bmodel_ibo_size = numtris * 3 * sizeof(idx[0]);
+	gl_bmodel_indirect_buffer_size = numtex * sizeof(cmds[0]);
+	cmds = (bmodel_draw_indirect_t *) calloc (numtex, sizeof(cmds[0]));
+	if (!cmds)
+		Sys_Error ("GL_BuildBModelMarkBuffers: out of memory (%d cmds)", numtex);
+	idx = (GLuint *) calloc (numtris * 3, sizeof(idx[0]));
+	if (!idx)
+		Sys_Error ("GL_BuildBModelMarkBuffers: out of memory (%d indices)", numtris * 3);
+	leafs = (bmodel_gpu_leaf_t *) calloc (cl.worldmodel->numleafs, sizeof(leafs[0]));
+	if (!leafs)
+		Sys_Error ("GL_BuildBModelMarkBuffers: out of memory (%d leafs)", cl.worldmodel->numleafs);
+	surfs = (bmodel_gpu_surf_t *) calloc (cl.worldmodel->numsurfaces, sizeof(surfs[0]));
+	if (!surfs)
+		Sys_Error ("GL_BuildBModelMarkBuffers: out of memory (%d surfs)", cl.worldmodel->numsurfaces);
+	texidx = (int *) calloc (maxnumtex, sizeof(texidx[0]));
+	if (!texidx)
+		Sys_Error ("GL_BuildBModelMarkBuffers: out of memory (%d tex indices)", maxnumtex);
 
-    for (i = 0; i < 3; i++) {
-      impact[i] = cl_dlights[lnum].origin[i] - surf->plane->normal[i] * dist;
-    }
+	// fill worldmodel leaf data
+	for (i = 0; i < cl.worldmodel->numleafs; i++)
+	{
+		mleaf_t *src = &cl.worldmodel->leafs[i + 1];
+		bmodel_gpu_leaf_t *dst = &leafs[i];
 
-    local[0] = DotProduct(impact, tex->vecs[0]) + tex->vecs[0][3];
-    local[1] = DotProduct(impact, tex->vecs[1]) + tex->vecs[1][3];
+		memcpy (dst->mins, src->minmaxs, 3 * sizeof(float));
+		memcpy (dst->maxs, src->minmaxs + 3, 3 * sizeof(float));
+		dst->firstsurf = src->firstmarksurface - cl.worldmodel->marksurfaces;
+		dst->surfcountsky = (src->nummarksurfaces << 1) | (src->contents == CONTENTS_SKY);
+	}
 
-    local[0] -= surf->texturemins[0];
-    local[1] -= surf->texturemins[1];
+	for (i = 0; i < cl.worldmodel->texofs[TEXTYPE_COUNT]; i++)
+		texidx[cl.worldmodel->usedtextures[i]] = i;
 
-    // johnfitz -- lit support via lordhavoc
-    bl = blocklights;
-    cred = cl_dlights[lnum].color[0] * 256.0f;
-    cgreen = cl_dlights[lnum].color[1] * 256.0f;
-    cblue = cl_dlights[lnum].color[2] * 256.0f;
-    // johnfitz
-    for (t = 0; t < tmax; t++) {
-      td = local[1] - t * 16;
-      if (td < 0)
-        td = -td;
-      for (s = 0; s < smax; s++) {
-        sd = local[0] - s * 16;
-        if (sd < 0)
-          sd = -sd;
-        if (sd > td)
-          dist = sd + (td >> 1);
-        else
-          dist = td + (sd >> 1);
-        if (dist < minlight)
-        // johnfitz -- lit support via lordhavoc
-        {
-          brightness = rad - dist;
-          bl[0] += (int)(brightness * cred);
-          bl[1] += (int)(brightness * cgreen);
-          bl[2] += (int)(brightness * cblue);
-        }
-        bl += 3;
-        // johnfitz
-      }
-    }
-  }
-}
+	// fill worldmodel surface data
+	for (i = 0; i < cl.worldmodel->numsurfaces; i++)
+	{
+		msurface_t *src = &cl.worldmodel->surfaces[i];
+		bmodel_gpu_surf_t *dst = &surfs[i];
+		float flip = (src->flags & SURF_PLANEBACK) ? -1.f : 1.f;
 
-/*
-===============
-R_BuildLightMap -- johnfitz -- revised for lit support via lordhavoc
+		if (src->texinfo->texnum < 0 || src->texinfo->texnum >= cl.worldmodel->numtextures)
+			Sys_Error ("GL_BuildBModelMarkBuffers: bad texnum %d (total=%d)", src->texinfo->texnum, cl.worldmodel->numtextures);
 
-Combine and scale multiple lightmaps into the 8.8 format in blocklights
-===============
-*/
-void R_BuildLightMap(msurface_t *surf, byte *dest, int stride) {
-  const int overbright = !!gl_overbright.value;
-  const int wide10bits = !!r_lightmapwide.value;
+		dst->plane[0] = src->plane->normal[0] * flip;
+		dst->plane[1] = src->plane->normal[1] * flip;
+		dst->plane[2] = src->plane->normal[2] * flip;
+		dst->plane[3] = src->plane->dist * flip;
+		dst->texnum = texidx[src->texinfo->texnum];
+		dst->numedges = src->numedges;
+		dst->firstvert = src->vbo_firstvert;
+	}
 
-  int smax, tmax;
-  unsigned r, g, b;
-  int i, j, size;
-  byte *lightmap;
-  unsigned scale;
-  int maps;
-  unsigned *bl;
+	// count triangles for each model texture
+	for (j = 1 ; j < MAX_MODELS; j++)
+	{
+		qmodel_t *m = cl.model_precache[j];
+		msurface_t *s;
+		if (!m || m->type != mod_brush)
+			continue;
 
-  surf->cached_dlight = (surf->dlightframe == r_framecount);
+		memset (texidx, 0, sizeof(texidx[0]) * m->numtextures);
+		for (i = 0; i < m->texofs[TEXTYPE_COUNT]; i++)
+			texidx[m->usedtextures[i]] = i;
 
-  smax = (surf->extents[0] >> 4) + 1;
-  tmax = (surf->extents[1] >> 4) + 1;
-  size = smax * tmax;
-  lightmap = surf->samples;
+		for (i = 0, s = m->surfaces + m->firstmodelsurface; i < m->nummodelsurfaces; i++, s++)
+			cmds[m->firstcmd + texidx[s->texinfo->texnum]].count += (q_max (s->numedges, 2) - 2) * 3;
+	}
 
-  if (cl.worldmodel->lightdata) {
-    // clear to no light
-    memset(&blocklights[0], 0,
-           size * 3 *
-               sizeof(unsigned int)); // johnfitz -- lit support via lordhavoc
+	// compute per-drawcall index buffer offsets
+	sum = 0;
+	for (i = 0; i < numtex; i++)
+	{
+		cmds[i].firstIndex = sum;
+		sum += cmds[i].count;
+		cmds[i].instanceCount = 1;
+	}
 
-    // add all the lightmaps
-    if (lightmap) {
-      for (maps = 0; maps < MAXLIGHTMAPS && surf->styles[maps] != 255; maps++) {
-        scale = d_lightstylevalue[surf->styles[maps]];
-        surf->cached_light[maps] = scale; // 8.8 fraction
-        // johnfitz -- lit support via lordhavoc
-        bl = blocklights;
-        for (i = 0; i < size; i++) {
-          *bl++ += *lightmap++ * scale;
-          *bl++ += *lightmap++ * scale;
-          *bl++ += *lightmap++ * scale;
-        }
-        // johnfitz
-      }
-    }
+	// build index buffer
+	for (j = 1 ; j < MAX_MODELS; j++)
+	{
+		qmodel_t *m = cl.model_precache[j];
+		msurface_t *s;
+		if (!m || m->type != mod_brush)
+			continue;
 
-    // add all the dynamic lights
-    if (surf->dlightframe == r_framecount)
-      R_AddDynamicLights(surf);
-  } else {
-    // set to full bright if no light data
-    memset(&blocklights[0], 255,
-           size * 3 *
-               sizeof(unsigned int)); // johnfitz -- lit support via lordhavoc
-  }
+		memset (texidx, 0, sizeof(texidx[0]) * m->numtextures);
+		for (i = 0; i < m->texofs[TEXTYPE_COUNT]; i++)
+			texidx[m->usedtextures[i]] = i;
 
-  // bound, invert, and shift
-  // store:
-  switch (gl_lightmap_format) {
-  case GL_RGBA:
-    stride -= smax * 4;
-    bl = blocklights;
-    for (i = 0; i < tmax; i++, dest += stride) {
-      for (j = 0; j < smax; j++) {
-        if (overbright) {
-          r = *bl++ >> 8;
-          g = *bl++ >> 8;
-          b = *bl++ >> 8;
-        } else {
-          r = *bl++ >> 7;
-          g = *bl++ >> 7;
-          b = *bl++ >> 7;
-          if (wide10bits) {
-            // artifically clamp to 255 so gl_overbright 0 renders as expected
-            // in the wide10bits case
-            r = (r > 255) ? 255 : r;
-            g = (g > 255) ? 255 : g;
-            b = (b > 255) ? 255 : b;
-            goto loc0;
-          }
-        }
-        if (wide10bits) {
-          r = (r > 1023) ? 1023 : r;
-          g = (g > 1023) ? 1023 : g;
-          b = (b > 1023) ? 1023 : b;
-        loc0:
-          *(unsigned int *)dest = (r << 22) | (g << 12) | (b << 2) | 3;
-          dest += 4;
-        } else {
-          *dest++ = (r > 255) ? 255 : r;
-          *dest++ = (g > 255) ? 255 : g;
-          *dest++ = (b > 255) ? 255 : b;
-          *dest++ = 255;
-        }
-      }
-    }
-    break;
-  case GL_BGRA:
-    stride -= smax * 4;
-    bl = blocklights;
-    for (i = 0; i < tmax; i++, dest += stride) {
-      for (j = 0; j < smax; j++) {
-        if (overbright) {
-          r = *bl++ >> 8;
-          g = *bl++ >> 8;
-          b = *bl++ >> 8;
-        } else {
-          r = *bl++ >> 7;
-          g = *bl++ >> 7;
-          b = *bl++ >> 7;
-          if (wide10bits) {
-            // artifically clamp to 255 so gl_overbright 0 renders as expected
-            // in the wide10bits case
-            r = (r > 255) ? 255 : r;
-            g = (g > 255) ? 255 : g;
-            b = (b > 255) ? 255 : b;
-            goto loc1;
-          }
-        }
-        if (wide10bits) {
-          r = (r > 1023) ? 1023 : r;
-          g = (g > 1023) ? 1023 : g;
-          b = (b > 1023) ? 1023 : b;
-        loc1:
-          *(unsigned int *)dest = (b << 22) | (g << 12) | (r << 2) | 3;
-          dest += 4;
-        } else {
-          *dest++ = (b > 255) ? 255 : b;
-          *dest++ = (g > 255) ? 255 : g;
-          *dest++ = (r > 255) ? 255 : r;
-          *dest++ = 255;
-        }
-      }
-    }
-    break;
-  default:
-    Sys_Error("R_BuildLightMap: bad lightmap format");
-  }
-}
+		for (i = 0, s = m->surfaces + m->firstmodelsurface; i < m->nummodelsurfaces; i++, s++)
+		{
+			bmodel_draw_indirect_t *draw = &cmds[m->firstcmd + texidx[s->texinfo->texnum]];
+			for (k = 2; k < s->numedges; k++)
+			{
+				idx[draw->firstIndex++] = s->vbo_firstvert;
+				idx[draw->firstIndex++] = s->vbo_firstvert + k - 1;
+				idx[draw->firstIndex++] = s->vbo_firstvert + k;
+			}
+		}
+	}
 
-/*
-===============
-R_UploadLightmap -- johnfitz -- uploads the modified lightmap to opengl if
-necessary
+	// restore firstIndex values (they get shifted in the previous loop)
+	sum = 0;
+	for (i = 0; i < numtex; i++)
+	{
+		cmds[i].firstIndex = sum;
+		sum += cmds[i].count;
+	}
 
-assumes lightmap texture is already bound
-===============
-*/
-static void R_UploadLightmap(int lmap) {
-  const int wide10bits = !!r_lightmapwide.value;
-  const GLenum type =
-      wide10bits ? GL_UNSIGNED_INT_10_10_10_2 : GL_UNSIGNED_BYTE;
-  struct lightmap_s *lm = &lightmaps[lmap];
+	// create gpu buffers
+	gl_bmodel_indirect_buffer = GL_CreateBuffer (GL_SHADER_STORAGE_BUFFER, GL_DYNAMIC_DRAW, "bmodel indirect cmds",
+		sizeof (cmds[0]) * numtex, cmds
+	);
+	gl_bmodel_ibo = GL_CreateBuffer (GL_ELEMENT_ARRAY_BUFFER, GL_DYNAMIC_DRAW, "bmodel indices",
+		sizeof (idx[0]) * numtris * 3, idx
+	);
+	gl_bmodel_leaf_buffer = GL_CreateBuffer (GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, "bmodel leafs",
+		sizeof (leafs[0]) * cl.worldmodel->numleafs, leafs
+	);
+	gl_bmodel_surf_buffer = GL_CreateBuffer (GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, "bmodel surfs",
+		sizeof (surfs[0]) * cl.worldmodel->numsurfaces, surfs
+	);
+	gl_bmodel_marksurf_buffer = GL_CreateBuffer (GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, "bmodel marksurfs",
+		sizeof(cl.worldmodel->marksurfaces[0]) * cl.worldmodel->nummarksurfaces, cl.worldmodel->marksurfaces
+	);
 
-  if (!lm->modified)
-    return;
-
-  lm->modified = false;
-
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, lm->rectchange.t, LMBLOCK_WIDTH,
-                  lm->rectchange.h, gl_lightmap_format, type,
-                  lm->data + lm->rectchange.t * LMBLOCK_WIDTH * lightmap_bytes);
-  lm->rectchange.l = LMBLOCK_WIDTH;
-  lm->rectchange.t = LMBLOCK_HEIGHT;
-  lm->rectchange.h = 0;
-  lm->rectchange.w = 0;
-
-  rs_dynamiclightmaps++;
-}
-
-void R_UploadLightmaps(void) {
-  int lmap;
-
-  for (lmap = 0; lmap < lightmap_count; lmap++) {
-    if (!lightmaps[lmap].modified)
-      continue;
-
-    GL_Bind(lightmaps[lmap].texture);
-    R_UploadLightmap(lmap);
-  }
-}
-
-/*
-================
-R_RebuildAllLightmaps -- johnfitz -- called when gl_overbright gets toggled
-================
-*/
-void R_RebuildAllLightmaps(void) {
-  const int wide10bits = !!r_lightmapwide.value;
-  const GLenum type =
-      wide10bits ? GL_UNSIGNED_INT_10_10_10_2 : GL_UNSIGNED_BYTE;
-  int i, j;
-  qmodel_t *mod;
-  msurface_t *fa;
-  byte *base;
-
-  if (!cl.worldmodel) // is this the correct test?
-    return;
-
-  // for each surface in each model, rebuild lightmap with new scale
-  for (i = 1; i < MAX_MODELS; i++) {
-    if (!(mod = cl.model_precache[i]))
-      continue;
-    fa = &mod->surfaces[mod->firstmodelsurface];
-    for (j = 0; j < mod->nummodelsurfaces; j++, fa++) {
-      if (fa->flags & SURF_DRAWTILED)
-        continue;
-      base = lightmaps[fa->lightmaptexturenum].data;
-      base += fa->light_t * LMBLOCK_WIDTH * lightmap_bytes +
-              fa->light_s * lightmap_bytes;
-      R_BuildLightMap(fa, base, LMBLOCK_WIDTH * lightmap_bytes);
-    }
-  }
-
-  // for each lightmap, upload it
-  for (i = 0; i < lightmap_count; i++) {
-    GL_Bind(lightmaps[i].texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LMBLOCK_WIDTH, LMBLOCK_HEIGHT,
-                    gl_lightmap_format, type, lightmaps[i].data);
-  }
+	// free cpu-side arrays
+	free (texidx);
+	free (surfs);
+	free (leafs);
+	free (idx);
+	free (cmds);
 }

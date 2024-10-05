@@ -34,25 +34,12 @@ net_driver_t net_drivers[] = {
      Loop_SendUnreliableMessage, Loop_CanSendMessage,
      Loop_CanSendUnreliableMessage, Loop_Close, Loop_Shutdown},
 
-    // {	"Datagram",
-    // 	false,
-    // 	Datagram_Init,
-    // 	Datagram_Listen,
-    // 	Datagram_SearchForHosts,
-    // 	Datagram_Connect,
-    // 	Datagram_CheckNewConnections,
-    // 	Datagram_GetMessage,
-    // 	Datagram_SendMessage,
-    // 	Datagram_SendUnreliableMessage,
-    // 	Datagram_CanSendMessage,
-    // 	Datagram_CanSendUnreliableMessage,
-    // 	Datagram_Close,
-    // 	Datagram_Shutdown
-    // }
 };
 
 const int net_numdrivers = Q_COUNTOF(net_drivers);
 
-net_landriver_t net_landrivers[] = {NULL};
+#include "net_udp.h"
+
+net_landriver_t *net_landrivers = NULL;
 
 const int net_numlandrivers = 0;

@@ -188,7 +188,7 @@ typedef struct {
 } net_landriver_t;
 
 #define MAX_NET_DRIVERS 8
-extern net_landriver_t net_landrivers[];
+extern net_landriver_t *net_landrivers;
 extern const int net_numlandrivers;
 
 typedef struct {

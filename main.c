@@ -18,8 +18,10 @@
 
 WGPURenderPipeline pipeline;
 
+int main_SDL(int argc, char *argv[]);
+
 bool frame(double time, void *userdata) {
-  printf("frame\n");
+
   WG *app = WG_Instance();
 
   SDL_Event event;
@@ -48,7 +50,7 @@ bool frame(double time, void *userdata) {
       .clearValue = {1.0, 0.0, 0.0, 1.0}};
 
 #ifndef WEBGPU_BACKEND_WGPU
-  renderPassColorAttachment.depthSlice = 0;
+  renderPassColorAttachment.depthSlice = 0; // wgpu doesn't implement this?
 #endif
 
   WGPURenderPassDescriptor renderPassDesc = {.nextInChain = NULL,
@@ -63,8 +65,8 @@ bool frame(double time, void *userdata) {
 
   // draw
   wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
-  // Draw 1 instance of a 3-vertices shape
   wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+  // end draw
 
   wgpuRenderPassEncoderEnd(renderPass);
   wgpuRenderPassEncoderRelease(renderPass);
@@ -73,11 +75,10 @@ bool frame(double time, void *userdata) {
   cmdBufferDescriptor.nextInChain = NULL;
   WGPUCommandBuffer command =
       wgpuCommandEncoderFinish(encoder, &cmdBufferDescriptor);
-  printf("%p\n", command);
   wgpuCommandEncoderRelease(encoder);
 
   wgpuQueueSubmit(app->queue, 1, &command);
-  // wgpuCommandBufferRelease(command);
+  wgpuCommandBufferRelease(command);
 
   wgpuTextureViewRelease(targetView);
 
@@ -104,8 +105,9 @@ bool frame(double time, void *userdata) {
   // return !app->shouldStop;
   return false;
 }
-
 int main(int argc, char *argv[]) {
+  main_SDL(argc, argv);
+
   printf("WG start\n");
   WG *app = WG_Instance();
   WG_Init();

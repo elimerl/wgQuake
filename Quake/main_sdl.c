@@ -23,11 +23,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)
-#if defined(USE_SDL2)
 #include <SDL2/SDL.h>
-#else
-#include <SDL/SDL.h>
-#endif
 #else
 #include "SDL.h"
 #endif
@@ -36,13 +32,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 static void Sys_AtExit(void) { SDL_Quit(); }
 
 static void Sys_InitSDL(void) {
-#if defined(USE_SDL2)
   SDL_version v;
   SDL_version *sdl_version = &v;
   SDL_GetVersion(&v);
-#else
-  const SDL_version *sdl_version = SDL_Linked_Version();
-#endif
 
   Sys_Printf("Found SDL version %i.%i.%i\n", sdl_version->major,
              sdl_version->minor, sdl_version->patch);
@@ -53,14 +45,88 @@ static void Sys_InitSDL(void) {
   atexit(Sys_AtExit);
 }
 
+/*
+==================
+Sys_WaitUntil
+==================
+*/
+static double Sys_WaitUntil(double endtime) {
+  static double estimate = 1e-3;
+  static double mean = 1e-3;
+  static double m2 = 0.0;
+  static double count = 1.0;
+
+  double now = Sys_DoubleTime();
+  double before, observed, delta, stddev;
+
+  endtime -= 1e-6; // allow finishing 1 microsecond earlier than requested
+
+  while (now + estimate < endtime) {
+    before = now;
+    SDL_Delay(1);
+    now = Sys_DoubleTime();
+
+    // Determine Sleep(1) mean duration & variance using Welford's algorithm
+    // https://blog.bearcats.nl/accurate-sleep-function/
+    if (count < 1e6) // skip this if we already have more than enough samples
+    {
+      ++count;
+      observed = now - before;
+      delta = observed - mean;
+      mean += delta / count;
+      m2 += delta * (observed - mean);
+      stddev = sqrt(m2 / (count - 1.0));
+      estimate = mean + 1.5 * stddev;
+
+      // Previous frame-limiting code assumed a duration of 2 msec.
+      // We don't want to burn more cycles in order to be more accurate
+      // in case the actual duration is higher.
+      estimate = q_min(estimate, 2e-3);
+    }
+  }
+
+  while (now < endtime) {
+#ifdef USE_SSE2
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+    _mm_pause();
+#endif
+    now = Sys_DoubleTime();
+  }
+
+  return now;
+}
+
+/*
+==================
+Sys_Throttle
+==================
+*/
+static double Sys_Throttle(double oldtime) {
+  return Sys_WaitUntil(oldtime + Host_GetFrameInterval());
+}
+
 #define DEFAULT_MEMORY                                                         \
-  (256 * 1024 * 1024) // ericw -- was 72MB (64-bit) / 64MB (32-bit)
+  (384 * 1024 * 1024) // ericw -- was 72MB (64-bit) / 64MB (32-bit)
 
 static quakeparms_t parms;
 
 // On OS X we call SDL_main from the launcher, but SDL2 doesn't redefine main
 // as SDL_main on OS X anymore, so we do it ourselves.
-#if defined(USE_SDL2) && defined(__APPLE__)
+#if defined(__APPLE__)
 #define main SDL_main
 #endif
 
@@ -84,7 +150,7 @@ int main_SDL(int argc, char *argv[]) {
 
   Sys_Init();
 
-  Sys_Printf("Initializing QuakeSpasm v%s\n", QUAKESPASM_VER_STRING);
+  Sys_Printf("Initializing Ironwail v%s\n", IRONWAIL_VER_STRING);
 
   parms.memsize = DEFAULT_MEMORY;
   if (COM_CheckParm("-heapsize")) {
@@ -113,6 +179,9 @@ int main_SDL(int argc, char *argv[]) {
         time = newtime - oldtime;
       }
 
+      newtime = Sys_Throttle(oldtime);
+      time = newtime - oldtime;
+
       Host_Frame(time);
       oldtime = newtime;
     }
@@ -129,13 +198,11 @@ int main_SDL(int argc, char *argv[]) {
       } else {
         scr_skipupdate = 0;
       }
-      newtime = Sys_DoubleTime();
+
+      newtime = Sys_Throttle(oldtime);
       time = newtime - oldtime;
 
       Host_Frame(time);
-
-      if (time < sys_throttle.value && !cls.timedemo)
-        SDL_Delay(1);
 
       oldtime = newtime;
     }
