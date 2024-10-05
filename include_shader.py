@@ -58,6 +58,17 @@ def preprocess(shaderfile, shaderpath, included=set(), defines=dict):
         elif line.startswith("#define"):
             name = line.split()[1]
             # TODO
+            #         elif line.startswith('#define'):
+            # parts = line.split(maxsplit=2)
+            # if len(parts) == 3:
+            #     symbol, value = parts[1], parts[2]
+            #     defines[symbol] = value
+            # elif len(parts) == 2:
+            #     symbol = parts[1]
+            #     defines[symbol] = ""  # Empty define
+            # else:
+            #     raise ValueError(f"Invalid #define directive: {line}")
+
         else:
             # Normal lines are added directly to the output
             processed.append(line)
