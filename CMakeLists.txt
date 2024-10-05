@@ -155,6 +155,19 @@ endif()
 
 set_property(TARGET wgQuake PROPERTY COMPILE_WARNING_AS_ERROR OFF)
 
+find_package(Python COMPONENTS Interpreter)
+file(GLOB SHADER_FILES ${SRC}/shaders/*.wgsl)
+foreach(SHADER IN LISTS SHADER_FILES)
+	get_filename_component(SHADER_BASENAME ${SHADER} NAME)
+	add_custom_command(TARGET wgQuake PRE_BUILD COMMAND
+		${Python_EXECUTABLE}
+		${SRC}/include_shader.py
+		"-i"
+		${SHADER}
+		${SRC}/shaders/inc/${SHADER_BASENAME}.h
+	)
+endforeach()
+
 add_custom_command(TARGET wgQuake POST_BUILD COMMAND
 	${CMAKE_COMMAND} -E copy_if_different
 	"${SRC}/Quake/quakespasm.pak"
